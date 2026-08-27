@@ -82,6 +82,8 @@ static int max_ser_parse_i2c_dt(struct max_ser_priv *priv)
 	struct device_node *node = NULL;
 	struct property *local;
 	struct property *remote;
+	int local_count;
+	int remote_count;
 	int ret, i;
 	u32 local_addr;
 	u32 remote_addr;
@@ -121,18 +123,37 @@ static int max_ser_parse_i2c_dt(struct max_ser_priv *priv)
 		return 0;
 	}
 
-	for (i = 0; i < priv->ops->num_i2c_xlates; i++) {
+	local_count = of_property_count_u32_elems(priv->dev->of_node,
+						  "i2c-addr-alias-map-local");
+	remote_count = of_property_count_u32_elems(priv->dev->of_node,
+						   "i2c-addr-alias-map-remote");
+	if (local_count < 0 || remote_count < 0)
+		return local_count < 0 ? local_count : remote_count;
+	if (local_count != remote_count ||
+	    local_count > priv->ops->num_i2c_xlates) {
+		dev_err(priv->dev,
+			"invalid I2C alias map size: local %d, remote %d, maximum %u\n",
+			local_count, remote_count, priv->ops->num_i2c_xlates);
+		return -EINVAL;
+	}
+
+	priv->num_i2c_xlates = local_count;
+	for (i = 0; i < priv->num_i2c_xlates; i++) {
 		ret = of_property_read_u32_index(priv->dev->of_node,
 						"i2c-addr-alias-map-local",
 						i, &local_addr);
-		if (ret != 0 || local_addr > 0x7f)
-			break;
+		if (ret)
+			return ret;
+		if (local_addr > 0x7f)
+			return -EINVAL;
 
 		ret = of_property_read_u32_index(priv->dev->of_node,
 						"i2c-addr-alias-map-remote",
 						i, &remote_addr);
-		if (ret != 0 || remote_addr > 0x7f)
-			break;
+		if (ret)
+			return ret;
+		if (remote_addr > 0x7f)
+			return -EINVAL;
 
 		xlate = &priv->i2c_xlates[i];
 		xlate->src = (u8)(local_addr & 0x7f);
@@ -140,11 +161,30 @@ static int max_ser_parse_i2c_dt(struct max_ser_priv *priv)
 
 		dev_info(priv->dev, "i2c address alias "
 			"index: %d local: 0x%x remote: 0x%x\n",
-			i, xlate->dst, xlate->src);
+			i, xlate->src, xlate->dst);
+	}
 
+	return 0;
+}
+
+static int max_ser_init_i2c_xlates(struct max_ser_priv *priv)
+{
+	unsigned int i;
+	int ret;
+
+	if (!priv->num_i2c_xlates)
+		return 0;
+	if (!priv->ops->init_i2c_xlate)
+		return -EOPNOTSUPP;
+
+	for (i = 0; i < priv->num_i2c_xlates; i++) {
 		ret = priv->ops->init_i2c_xlate(priv, i);
-		if (ret != 0)
-			break;
+		if (ret) {
+			dev_err(priv->dev,
+				"failed to program I2C alias index %u: %d\n",
+				i, ret);
+			return ret;
+		}
 	}
 
 	return 0;
@@ -633,6 +673,10 @@ int max_ser_probe(struct max_ser_priv *priv)
 		return ret;
 
 	ret = max_ser_init(priv);
+	if (ret)
+		return ret;
+
+	ret = max_ser_init_i2c_xlates(priv);
 	if (ret)
 		return ret;
 

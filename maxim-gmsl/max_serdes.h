@@ -94,7 +94,11 @@ int max_ser_ch_enable_by_node(struct device_node *ser_np,
 			      unsigned int channel, bool enable);
 int max_des_ch_enable_by_node(struct device_node *des_np,
 			      unsigned int channel, bool enable);
+int max_des_set_i2c_link_quarantine_by_node(struct device_node *des_np,
+					    unsigned int link,
+					    bool quarantine);
 int max_des_is_ready_by_node(struct device_node *des_np);
+int max_des_serializers_are_ready_by_node(struct device_node *des_np);
 int max_ser_is_ready_by_node(struct device_node *ser_np);
 
 #endif // MAX_SERDES_H

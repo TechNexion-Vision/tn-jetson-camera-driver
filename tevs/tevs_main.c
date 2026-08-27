@@ -282,6 +282,9 @@
 
 #define DEFAULT_HEADER_VERSION 				3
 #define TEVS_BOOT_TIME						(250)
+#define TEVS_BOOT_TIMEOUT					(2000)
+#define TEVS_CTRL_READ_RETRIES				(5)
+#define TEVS_CTRL_RETRY_DELAY_MS			(50)
 #define TOTAL_MICROSEC_PERSEC				(1000000)
 
 #define TEVS_IMG_FORMAT_UYVY				(0x50)
@@ -345,6 +348,7 @@ struct tevs {
 	u8 selected_mode;
 	u8 selected_sensor;
 	bool hw_reset_mode;
+	bool reset_booted;
 	int trigger_mode;
 	char *sensor_name;
 	int vc_id;
@@ -352,7 +356,6 @@ struct tevs {
 
 	struct mutex lock; /* Protects formats */
 	/* V4L2 Controls */
-	struct v4l2_ctrl_handler ctrls;
 	struct v4l2_ctrl *brightness;
 	struct v4l2_ctrl *contrast;
 	struct v4l2_ctrl *saturation;
@@ -462,6 +465,11 @@ static int tevs_gmsl_parse_and_wait(struct tevs *tevs)
 		return dev_err_probe(tevs->dev, ret,
 				     "waiting for GMSL serializer\n");
 
+	ret = max_des_serializers_are_ready_by_node(tevs->gmsl_des_np);
+	if (ret)
+		return dev_err_probe(tevs->dev, ret,
+				     "waiting for all active GMSL serializers\n");
+
 	return 0;
 }
 
@@ -505,6 +513,47 @@ static int tevs_gmsl_enable(struct tevs *tevs, bool enable)
 
 	return ret;
 }
+
+static int tevs_gmsl_recover_i2c_link(struct tevs *tevs)
+{
+	int ret;
+
+	if (!tevs->gmsl_des_np)
+		return 0;
+
+	ret = max_des_set_i2c_link_quarantine_by_node(tevs->gmsl_des_np,
+						       tevs->gmsl_des_channel,
+						       true);
+	if (ret == -EOPNOTSUPP)
+		return 0;
+	if (ret)
+		return ret;
+
+	return max_des_set_i2c_link_quarantine_by_node(tevs->gmsl_des_np,
+						tevs->gmsl_des_channel,
+						false);
+}
+
+static void tevs_gmsl_quarantine_i2c_link(struct tevs *tevs,
+					  const char *reason)
+{
+	int ret;
+
+	if (!tevs->gmsl_des_np)
+		return;
+
+	ret = max_des_set_i2c_link_quarantine_by_node(tevs->gmsl_des_np,
+						      tevs->gmsl_des_channel,
+						      true);
+	if (ret && ret != -EOPNOTSUPP)
+		dev_warn(tevs->dev,
+			 "failed to quarantine GMSL I2C link %u after %s: %d\n",
+			 tevs->gmsl_des_channel, reason, ret);
+	else if (!ret)
+		dev_warn(tevs->dev, "quarantined GMSL I2C link %u after %s\n",
+			 tevs->gmsl_des_channel, reason);
+}
+
 #endif
 
 static struct tevs* _to_tevs_priv(struct v4l2_ctrl *ctrl)
@@ -698,23 +747,45 @@ static int tevs_standby(struct tevs *tevs, int enable)
 
 static int tevs_check_boot_state(struct tevs *tevs)
 {
-	u16 boot_state;
-	u8 timeout = 0;
-	int ret = 0;
+	u16 boot_state = 0xFFFF;
+	unsigned long start = jiffies;
+	unsigned long deadline = start + msecs_to_jiffies(TEVS_BOOT_TIMEOUT);
+	unsigned int attempts = 0;
+	int ret = -ETIMEDOUT;
+	int read_ret;
 
-	while (timeout < 20) {
-		tevs_i2c_read_16b(tevs,
+	do {
+		attempts++;
+		read_ret = tevs_i2c_read_16b(tevs,
 				HOST_COMMAND_TEVS_BOOT_STATE, &boot_state);
-		if (boot_state == 0x08)
-			break;
-		dev_dbg(tevs->dev, "tevs bootup state: %d\n", boot_state);
-		if (++timeout >= 20) {
-			dev_err(tevs->dev, "tevs bootup timeout: state: 0x%02X\n", boot_state);
-			ret = -EINVAL;
+		if (!read_ret && boot_state == 0x08) {
+			dev_dbg(tevs->dev,
+				 "TEVS boot ready after %u ms (%u attempts)\n",
+				 jiffies_to_msecs(jiffies - start), attempts);
+			return 0;
+		}
+		if (read_ret) {
+			ret = read_ret;
+#ifdef GMSL_SERDES_CTRL
+			read_ret = tevs_gmsl_recover_i2c_link(tevs);
+			if (read_ret) {
+				dev_err(tevs->dev,
+					"failed to recover GMSL I2C link after boot-state read error: %d\n",
+					read_ret);
+				return ret;
+			}
+#endif
+		} else {
+			ret = -ETIMEDOUT;
+			dev_dbg(tevs->dev, "TEVS boot state: 0x%04x\n",
+				boot_state);
 		}
 		msleep(50);
-	}
+	} while (time_before(jiffies, deadline));
 
+	dev_err(tevs->dev,
+		"TEVS boot failed after %u ms (%u attempts): last state 0x%04x, error %d\n",
+		jiffies_to_msecs(jiffies - start), attempts, boot_state, ret);
 	return ret;
 }
 
@@ -1069,6 +1140,7 @@ static int tevs_set_bsl_mode(struct tevs *tevs, s32 mode)
 	switch (mode) {
 	case TEVS_BSL_MODE_NORMAL_IDX:
 		gpiod_set_value_cansleep(tevs->reset_gpio, 0);
+		tevs->reset_booted = false;
 		usleep_range(9000, 10000);
 		gpiod_set_value_cansleep(tevs->reset_gpio, 1);
 		usleep_range(9000, 10000);
@@ -1079,6 +1151,7 @@ static int tevs_set_bsl_mode(struct tevs *tevs, s32 mode)
 			dev_err(tevs->dev, "check tevs bootup status failed before change data frequency\n");
 			return -EINVAL;
 		}
+		tevs->reset_booted = true;
 
 		if (tevs->data_frequency != 0) {
 			tevs_i2c_read_16b(tevs, HOST_COMMAND_ISP_CTRL_MIPI_FREQ,
@@ -1104,6 +1177,7 @@ static int tevs_set_bsl_mode(struct tevs *tevs, s32 mode)
 		break;
 	case TEVS_BSL_MODE_FLASH_IDX:
 		gpiod_set_value_cansleep(tevs->reset_gpio, 0);
+		tevs->reset_booted = false;
 		usleep_range(9000, 10000);
 		gpiod_set_value_cansleep(tevs->standby_gpio, 1);
 		msleep(100);
@@ -1357,6 +1431,120 @@ static const struct v4l2_ctrl_config tevs_trigger_mode = {
 	.qmenu = trigger_mode_strings,
 };
 
+static int tevs_check_ctrl(struct tevs *tevs, struct v4l2_ctrl *ctrl,
+			   const char *name)
+{
+	struct v4l2_ctrl_handler *handler =
+		&tevs->s_data->tegracam_ctrl_hdl->ctrl_handler;
+	int ret;
+
+	if (ctrl && !handler->error)
+		return 0;
+
+	ret = handler->error;
+	if (!ret)
+		ret = -ENOMEM;
+
+	dev_err(tevs->dev, "failed to create %s control: %d\n", name, ret);
+
+	return ret;
+}
+
+static int tevs_read_ctrl_value(struct tevs *tevs, u16 reg, u8 size,
+				u32 mask, s64 *value)
+{
+	u8 data[4] = { 0 };
+	u32 raw;
+	int ret;
+
+	if (size != sizeof(u16) && size != sizeof(u32))
+		return -EINVAL;
+
+	ret = tevs_i2c_read(tevs, reg, data, size);
+	if (ret)
+		return ret;
+
+	if (size == sizeof(u16)) {
+		raw = ((u32)data[0] << 8) | data[1];
+	} else if (size == sizeof(u32)) {
+		raw = ((u32)data[0] << 24) | ((u32)data[1] << 16) |
+		      ((u32)data[2] << 8) | data[3];
+	}
+
+	*value = raw & mask;
+
+	return 0;
+}
+
+static int tevs_read_ctrl_range(struct tevs *tevs, u16 reg, u16 max_reg,
+				u16 min_reg, u8 size, u32 mask,
+				s64 *ctrl_def, s64 *ctrl_max,
+				s64 *ctrl_min)
+{
+	s64 def = 0;
+	s64 max = 0;
+	s64 min = 0;
+	int ret = -ERANGE;
+	int i;
+
+	for (i = 0; i < TEVS_CTRL_READ_RETRIES; i++) {
+		ret = tevs_read_ctrl_value(tevs, reg, size, mask, &def);
+		if (ret) {
+			dev_dbg(tevs->dev,
+				 "control 0x%04x default read failed on attempt %d: %d\n",
+				 reg, i + 1, ret);
+			goto retry;
+		}
+
+		ret = tevs_read_ctrl_value(tevs, max_reg, size, mask, &max);
+		if (ret) {
+			dev_dbg(tevs->dev,
+				 "control 0x%04x maximum read failed on attempt %d: %d\n",
+				 reg, i + 1, ret);
+			goto retry;
+		}
+
+		ret = tevs_read_ctrl_value(tevs, min_reg, size, mask, &min);
+		if (ret) {
+			dev_dbg(tevs->dev,
+				 "control 0x%04x minimum read failed on attempt %d: %d\n",
+				 reg, i + 1, ret);
+			goto retry;
+		}
+
+		if (min <= def && def <= max) {
+			*ctrl_min = min;
+			*ctrl_max = max;
+			*ctrl_def = def;
+			return 0;
+		}
+
+		ret = -ERANGE;
+		dev_dbg(tevs->dev,
+			 "invalid control range reg 0x%04x: min %lld, max %lld, default %lld\n",
+			 reg, min, max, def);
+
+retry:
+#ifdef GMSL_SERDES_CTRL
+		{
+			int recover_ret = tevs_gmsl_recover_i2c_link(tevs);
+
+			if (recover_ret)
+				dev_warn(tevs->dev,
+					 "control 0x%04x GMSL I2C recovery failed: %d\n",
+					 reg, recover_ret);
+		}
+#endif
+		if (i + 1 < TEVS_CTRL_READ_RETRIES)
+			msleep(TEVS_CTRL_RETRY_DELAY_MS);
+	}
+
+	dev_err(tevs->dev,
+		"failed to read valid control 0x%04x range: min %lld, max %lld, default %lld, error %d\n",
+		reg, min, max, def, ret);
+	return ret;
+}
+
 static int tevs_ctrls_init(struct tevs *tevs)
 {
 	struct tegracam_ctrl_handler *ctrl_hdl;
@@ -1373,52 +1561,55 @@ static int tevs_ctrls_init(struct tevs *tevs)
 
 	ctrl_hdl = tevs->s_data->tegracam_ctrl_hdl;
 
-	if (ctrl_hdl == NULL) {
-		dev_info(&tevs->tc_dev->client->dev,"init control handler...\n");
-		ret = v4l2_ctrl_handler_init(&ctrl_hdl->ctrl_handler, 26);
-		if (ret) {
-			dev_err(&tevs->tc_dev->client->dev,"init handler fail\n");
-			return ret;
-		}
+	if (!ctrl_hdl) {
+		dev_err(tevs->dev, "missing tegracam control handler\n");
+		return -EINVAL;
 	}
+	ctrl_hdl->ctrl_handler.lock = &tevs->lock;
 
-	ret = tevs_i2c_read_16b(tevs, TEVS_BRIGHTNESS, &val);
-	ctrl_def = val & TEVS_BRIGHTNESS_MASK;
-	ret += tevs_i2c_read_16b(tevs, TEVS_BRIGHTNESS_MAX, &val);
-	ctrl_max = val & TEVS_BRIGHTNESS_MASK;
-	ret += tevs_i2c_read_16b(tevs, TEVS_BRIGHTNESS_MIN, &val);
-	ctrl_min = val & TEVS_BRIGHTNESS_MASK;
+	ret = tevs_read_ctrl_range(tevs, TEVS_BRIGHTNESS,
+				   TEVS_BRIGHTNESS_MAX, TEVS_BRIGHTNESS_MIN,
+				   sizeof(u16), TEVS_BRIGHTNESS_MASK, &ctrl_def,
+				   &ctrl_max, &ctrl_min);
 	if (ret)
 		goto error;
 	tevs->brightness = v4l2_ctrl_new_std(&ctrl_hdl->ctrl_handler, &tevs_ctrl_ops,
 					     V4L2_CID_BRIGHTNESS, ctrl_min,
 					     ctrl_max, 1, ctrl_def);
+	ret = tevs_check_ctrl(tevs, tevs->brightness, "brightness");
+	if (ret)
+		goto error;
 
-	ret = tevs_i2c_read_16b(tevs, TEVS_CONTRAST, &val);
-	ctrl_def = val & TEVS_CONTRAST_MASK;
-	ret += tevs_i2c_read_16b(tevs, TEVS_CONTRAST_MAX, &val);
-	ctrl_max = val & TEVS_CONTRAST_MASK;
-	ret += tevs_i2c_read_16b(tevs, TEVS_CONTRAST_MIN, &val);
-	ctrl_min = val & TEVS_CONTRAST_MASK;
+	ret = tevs_read_ctrl_range(tevs, TEVS_CONTRAST, TEVS_CONTRAST_MAX,
+				   TEVS_CONTRAST_MIN, sizeof(u16), TEVS_CONTRAST_MASK,
+				   &ctrl_def, &ctrl_max, &ctrl_min);
 	if (ret)
 		goto error;
 	tevs->contrast = v4l2_ctrl_new_std(&ctrl_hdl->ctrl_handler, &tevs_ctrl_ops,
 					   V4L2_CID_CONTRAST, ctrl_min,
 					   ctrl_max, 1, ctrl_def);
+	ret = tevs_check_ctrl(tevs, tevs->contrast, "contrast");
+	if (ret)
+		goto error;
 
-	ret = tevs_i2c_read_16b(tevs, TEVS_SATURATION, &val);
-	ctrl_def = val & TEVS_SATURATION_MASK;
-	ret += tevs_i2c_read_16b(tevs, TEVS_SATURATION_MAX, &val);
-	ctrl_max = val & TEVS_SATURATION_MASK;
-	ret += tevs_i2c_read_16b(tevs, TEVS_SATURATION_MIN, &val);
-	ctrl_min = val & TEVS_SATURATION_MASK;
+	ret = tevs_read_ctrl_range(tevs, TEVS_SATURATION,
+				   TEVS_SATURATION_MAX, TEVS_SATURATION_MIN,
+				   sizeof(u16), TEVS_SATURATION_MASK, &ctrl_def,
+				   &ctrl_max, &ctrl_min);
 	if (ret)
 		goto error;
 	tevs->saturation = v4l2_ctrl_new_std(&ctrl_hdl->ctrl_handler, &tevs_ctrl_ops,
 					     V4L2_CID_SATURATION, ctrl_min,
 					     ctrl_max, 1, ctrl_def);
+	ret = tevs_check_ctrl(tevs, tevs->saturation, "saturation");
+	if (ret)
+		goto error;
 
-	tevs->awb = v4l2_ctrl_new_custom(&ctrl_hdl->ctrl_handler, &tevs_awb_mode, NULL);
+	tevs->awb = v4l2_ctrl_new_custom(&ctrl_hdl->ctrl_handler,
+					 &tevs_awb_mode, NULL);
+	ret = tevs_check_ctrl(tevs, tevs->awb, "AWB");
+	if (ret)
+		goto error;
 	ret = tevs_i2c_read_16b(tevs, TEVS_AWB_CTRL_MODE, &val);
 	if (ret)
 		goto error;
@@ -1437,41 +1628,45 @@ static int tevs_ctrls_init(struct tevs *tevs)
 		break;
 	}
 
-	ret = tevs_i2c_read_16b(tevs, TEVS_GAMMA, &val);
-	ctrl_def = val & TEVS_GAMMA_MASK;
-	ret += tevs_i2c_read_16b(tevs, TEVS_GAMMA_MAX, &val);
-	ctrl_max = val & TEVS_GAMMA_MASK;
-	ret += tevs_i2c_read_16b(tevs, TEVS_GAMMA_MIN, &val);
-	ctrl_min = val & TEVS_GAMMA_MASK;
+	ret = tevs_read_ctrl_range(tevs, TEVS_GAMMA, TEVS_GAMMA_MAX,
+				   TEVS_GAMMA_MIN, sizeof(u16), TEVS_GAMMA_MASK,
+				   &ctrl_def, &ctrl_max, &ctrl_min);
 	if (ret)
 		goto error;
 	tevs->gamma = v4l2_ctrl_new_std(&ctrl_hdl->ctrl_handler, &tevs_ctrl_ops,
 					V4L2_CID_GAMMA, ctrl_min, ctrl_max, 1,
 					ctrl_def);
+	ret = tevs_check_ctrl(tevs, tevs->gamma, "gamma");
+	if (ret)
+		goto error;
 
-	ret = tevs_i2c_read(tevs, TEVS_AE_MANUAL_EXP_TIME, exp, 4);
-	ctrl_def = be32_to_cpup((__be32 *)exp) & TEVS_AE_MANUAL_EXP_TIME_MASK;
-	ret += tevs_i2c_read(tevs, TEVS_AE_MANUAL_EXP_TIME_MAX, exp, 4);
-	ctrl_max = be32_to_cpup((__be32 *)exp) & TEVS_AE_MANUAL_EXP_TIME_MASK;
-	ret += tevs_i2c_read(tevs, TEVS_AE_MANUAL_EXP_TIME_MIN, exp, 4);
-	ctrl_min = be32_to_cpup((__be32 *)exp) & TEVS_AE_MANUAL_EXP_TIME_MASK;
+	ret = tevs_read_ctrl_range(tevs, TEVS_AE_MANUAL_EXP_TIME,
+				   TEVS_AE_MANUAL_EXP_TIME_MAX,
+				   TEVS_AE_MANUAL_EXP_TIME_MIN, sizeof(u32),
+				   TEVS_AE_MANUAL_EXP_TIME_MASK, &ctrl_def,
+				   &ctrl_max, &ctrl_min);
 	if (ret)
 		goto error;
 	tevs->exp_time = v4l2_ctrl_new_std(&ctrl_hdl->ctrl_handler, &tevs_ctrl_ops,
 					   V4L2_CID_EXPOSURE, ctrl_min,
 					   ctrl_max, 1, ctrl_def);
+	ret = tevs_check_ctrl(tevs, tevs->exp_time, "exposure");
+	if (ret)
+		goto error;
 
-	ret = tevs_i2c_read_16b(tevs, TEVS_AE_MANUAL_GAIN, &val);
-	ctrl_def = val & TEVS_AE_MANUAL_GAIN_MASK;
-	ret += tevs_i2c_read_16b(tevs, TEVS_AE_MANUAL_GAIN_MAX, &val);
-	ctrl_max = val & TEVS_AE_MANUAL_GAIN_MASK;
-	ret += tevs_i2c_read_16b(tevs, TEVS_AE_MANUAL_GAIN_MIN, &val);
-	ctrl_min = val & TEVS_AE_MANUAL_GAIN_MASK;
+	ret = tevs_read_ctrl_range(tevs, TEVS_AE_MANUAL_GAIN,
+				   TEVS_AE_MANUAL_GAIN_MAX,
+				   TEVS_AE_MANUAL_GAIN_MIN, sizeof(u16),
+				   TEVS_AE_MANUAL_GAIN_MASK, &ctrl_def,
+				   &ctrl_max, &ctrl_min);
 	if (ret)
 		goto error;
 	tevs->exp_gain = v4l2_ctrl_new_std(&ctrl_hdl->ctrl_handler, &tevs_ctrl_ops,
 					   V4L2_CID_GAIN, ctrl_min, ctrl_max, 1,
 					   ctrl_def);
+	ret = tevs_check_ctrl(tevs, tevs->exp_gain, "gain");
+	if (ret)
+		goto error;
 
 	ret = tevs_i2c_read_16b(tevs, TEVS_ORIENTATION, &val);
 	ctrl_def = val & TEVS_ORIENTATION_HFLIP;
@@ -1479,10 +1674,16 @@ static int tevs_ctrls_init(struct tevs *tevs)
 		goto error;
 	tevs->hflip = v4l2_ctrl_new_std(&ctrl_hdl->ctrl_handler, &tevs_ctrl_ops,
 					V4L2_CID_HFLIP, 0x0, 0x1, 1, ctrl_def);
+	ret = tevs_check_ctrl(tevs, tevs->hflip, "horizontal flip");
+	if (ret)
+		goto error;
 
 	ctrl_def = (val & TEVS_ORIENTATION_VFLIP) >> TEVS_ORIENTATION_VFLIP_BIT;
 	tevs->vflip = v4l2_ctrl_new_std(&ctrl_hdl->ctrl_handler, &tevs_ctrl_ops,
 					V4L2_CID_VFLIP, 0x0, 0x1, 1, ctrl_def);
+	ret = tevs_check_ctrl(tevs, tevs->vflip, "vertical flip");
+	if (ret)
+		goto error;
 
 	ret = tevs_i2c_read_16b(tevs, TEVS_FLICK_CTRL, &val);
 	if (ret)
@@ -1510,44 +1711,56 @@ static int tevs_ctrls_init(struct tevs *tevs)
 					V4L2_CID_POWER_LINE_FREQUENCY,
 					V4L2_CID_POWER_LINE_FREQUENCY_AUTO,
 					0, ctrl_def);
+	ret = tevs_check_ctrl(tevs, tevs->flick, "power-line frequency");
+	if (ret)
+		goto error;
 
-	ret = tevs_i2c_read_16b(tevs, TEVS_AWB_MANUAL_TEMP, &val);
-	ctrl_def = val & TEVS_AWB_MANUAL_TEMP_MASK;
-	ret += tevs_i2c_read_16b(tevs, TEVS_AWB_MANUAL_TEMP_MAX, &val);
-	ctrl_max = val & TEVS_AWB_MANUAL_TEMP_MASK;
-	ret += tevs_i2c_read_16b(tevs, TEVS_AWB_MANUAL_TEMP_MIN, &val);
-	ctrl_min = val & TEVS_AWB_MANUAL_TEMP_MASK;
+	ret = tevs_read_ctrl_range(tevs, TEVS_AWB_MANUAL_TEMP,
+				   TEVS_AWB_MANUAL_TEMP_MAX,
+				   TEVS_AWB_MANUAL_TEMP_MIN, sizeof(u16),
+				   TEVS_AWB_MANUAL_TEMP_MASK, &ctrl_def,
+				   &ctrl_max, &ctrl_min);
 	if (ret)
 		goto error;
 	tevs->wb_temp = v4l2_ctrl_new_std(&ctrl_hdl->ctrl_handler, &tevs_ctrl_ops,
 					  V4L2_CID_WHITE_BALANCE_TEMPERATURE,
 					  ctrl_min, ctrl_max, 1, ctrl_def);
+	ret = tevs_check_ctrl(tevs, tevs->wb_temp, "white-balance temperature");
+	if (ret)
+		goto error;
 
-	ret = tevs_i2c_read_16b(tevs, TEVS_SHARPEN, &val);
-	ctrl_def = val & TEVS_SHARPEN_MASK;
-	ret += tevs_i2c_read_16b(tevs, TEVS_SHARPEN_MAX, &val);
-	ctrl_max = val & TEVS_SHARPEN_MASK;
-	ret += tevs_i2c_read_16b(tevs, TEVS_SHARPEN_MIN, &val);
-	ctrl_min = val & TEVS_SHARPEN_MASK;
+	ret = tevs_read_ctrl_range(tevs, TEVS_SHARPEN, TEVS_SHARPEN_MAX,
+				   TEVS_SHARPEN_MIN, sizeof(u16),
+				   TEVS_SHARPEN_MASK, &ctrl_def,
+				   &ctrl_max, &ctrl_min);
 	if (ret)
 		goto error;
 	tevs->sharpness = v4l2_ctrl_new_std(&ctrl_hdl->ctrl_handler, &tevs_ctrl_ops,
 					    V4L2_CID_SHARPNESS, ctrl_min,
 					    ctrl_max, 1, ctrl_def);
+	ret = tevs_check_ctrl(tevs, tevs->sharpness, "sharpness");
+	if (ret)
+		goto error;
 
-	ret = tevs_i2c_read_16b(tevs, TEVS_BACKLIGHT_COMPENSATION, &val);
-	ctrl_def = val & TEVS_BACKLIGHT_COMPENSATION_MASK;
-	ret += tevs_i2c_read_16b(tevs, TEVS_BACKLIGHT_COMPENSATION_MAX, &val);
-	ctrl_max = val & TEVS_BACKLIGHT_COMPENSATION_MASK;
-	ret += tevs_i2c_read_16b(tevs, TEVS_BACKLIGHT_COMPENSATION_MIN, &val);
-	ctrl_min = val & TEVS_BACKLIGHT_COMPENSATION_MASK;
+	ret = tevs_read_ctrl_range(tevs, TEVS_BACKLIGHT_COMPENSATION,
+				   TEVS_BACKLIGHT_COMPENSATION_MAX,
+				   TEVS_BACKLIGHT_COMPENSATION_MIN, sizeof(u16),
+				   TEVS_BACKLIGHT_COMPENSATION_MASK, &ctrl_def,
+				   &ctrl_max, &ctrl_min);
 	if (ret)
 		goto error;
 	tevs->backlight_comp = v4l2_ctrl_new_std(
 		&ctrl_hdl->ctrl_handler, &tevs_ctrl_ops, V4L2_CID_BACKLIGHT_COMPENSATION,
 		ctrl_min, ctrl_max, 1, ctrl_def);
+	ret = tevs_check_ctrl(tevs, tevs->backlight_comp,
+			      "backlight compensation");
+	if (ret)
+		goto error;
 
 	tevs->colorfx = v4l2_ctrl_new_custom(&ctrl_hdl->ctrl_handler, &tevs_sfx_mode, NULL);
+	ret = tevs_check_ctrl(tevs, tevs->colorfx, "special effect");
+	if (ret)
+		goto error;
 	ret = tevs_i2c_read_16b(tevs, TEVS_SFX_MODE, &val);
 	if (ret)
 		goto error;
@@ -1579,6 +1792,9 @@ static int tevs_ctrls_init(struct tevs *tevs)
 	}
 
 	tevs->ae = v4l2_ctrl_new_custom(&ctrl_hdl->ctrl_handler, &tevs_ae_mode, NULL);
+	ret = tevs_check_ctrl(tevs, tevs->ae, "auto exposure");
+	if (ret)
+		goto error;
 	ret = tevs_i2c_read_16b(tevs, TEVS_AE_CTRL_MODE, &val);
 	if (ret)
 		goto error;
@@ -1605,47 +1821,51 @@ static int tevs_ctrls_init(struct tevs *tevs)
 			break;
 	}
 
-	ret = tevs_i2c_read_16b(tevs, TEVS_DZ_CT_X, &val);
-	ctrl_def = val & TEVS_DZ_CT_MASK;
-	ret += tevs_i2c_read_16b(tevs, TEVS_DZ_CT_MAX, &val);
-	ctrl_max = val & TEVS_DZ_CT_MASK;
-	ret += tevs_i2c_read_16b(tevs, TEVS_DZ_CT_MIN, &val);
-	ctrl_min = val & TEVS_DZ_CT_MASK;
+	ret = tevs_read_ctrl_range(tevs, TEVS_DZ_CT_X, TEVS_DZ_CT_MAX,
+				   TEVS_DZ_CT_MIN, sizeof(u16), TEVS_DZ_CT_MASK,
+				   &ctrl_def, &ctrl_max, &ctrl_min);
 	if (ret)
 		goto error;
 	tevs->pan = v4l2_ctrl_new_std(&ctrl_hdl->ctrl_handler, &tevs_ctrl_ops,
 				      V4L2_CID_PAN_ABSOLUTE, ctrl_min, ctrl_max,
 				      1, ctrl_def);
+	ret = tevs_check_ctrl(tevs, tevs->pan, "pan");
+	if (ret)
+		goto error;
 
-	ret = tevs_i2c_read_16b(tevs, TEVS_DZ_CT_Y, &val);
-	ctrl_def = val & TEVS_DZ_CT_MASK;
-	ret += tevs_i2c_read_16b(tevs, TEVS_DZ_CT_MAX, &val);
-	ctrl_max = val & TEVS_DZ_CT_MASK;
-	ret += tevs_i2c_read_16b(tevs, TEVS_DZ_CT_MIN, &val);
-	ctrl_min = val & TEVS_DZ_CT_MASK;
+	ret = tevs_read_ctrl_range(tevs, TEVS_DZ_CT_Y, TEVS_DZ_CT_MAX,
+				   TEVS_DZ_CT_MIN, sizeof(u16), TEVS_DZ_CT_MASK,
+				   &ctrl_def, &ctrl_max, &ctrl_min);
 	if (ret)
 		goto error;
 	tevs->tilt = v4l2_ctrl_new_std(&ctrl_hdl->ctrl_handler, &tevs_ctrl_ops,
 				       V4L2_CID_TILT_ABSOLUTE, ctrl_min,
 				       ctrl_max, 1, ctrl_def);
+	ret = tevs_check_ctrl(tevs, tevs->tilt, "tilt");
+	if (ret)
+		goto error;
 
-	ret = tevs_i2c_read_16b(tevs, TEVS_DZ_TGT_FCT, &val);
-	ctrl_def = val & TEVS_DZ_TGT_FCT_MASK;
-	ret += tevs_i2c_read_16b(tevs, TEVS_DZ_TGT_FCT_MAX, &val);
-	ctrl_max = val & TEVS_DZ_TGT_FCT_MASK;
-	ret += tevs_i2c_read_16b(tevs, TEVS_DZ_TGT_FCT_MIN, &val);
-	ctrl_min = val & TEVS_DZ_TGT_FCT_MASK;
+	ret = tevs_read_ctrl_range(tevs, TEVS_DZ_TGT_FCT,
+				   TEVS_DZ_TGT_FCT_MAX, TEVS_DZ_TGT_FCT_MIN,
+				   sizeof(u16), TEVS_DZ_TGT_FCT_MASK, &ctrl_def,
+				   &ctrl_max, &ctrl_min);
 	if (ret)
 		goto error;
 	tevs->zoom = v4l2_ctrl_new_std(&ctrl_hdl->ctrl_handler, &tevs_ctrl_ops,
 				       V4L2_CID_ZOOM_ABSOLUTE, ctrl_min,
 				       ctrl_max, 1, ctrl_def);
+	ret = tevs_check_ctrl(tevs, tevs->zoom, "zoom");
+	if (ret)
+		goto error;
 
 	/* By default, link_freq and pixel_rate is read only */
 	link_freq[0] = (u64)(tevs->data_frequency >> 1) * 1000000ULL;
 	tevs->link_freq = v4l2_ctrl_new_int_menu(
 		&ctrl_hdl->ctrl_handler, &tevs_ctrl_ops, V4L2_CID_LINK_FREQ,
 		ARRAY_SIZE(link_freq) - 1, 0, link_freq);
+	ret = tevs_check_ctrl(tevs, tevs->link_freq, "link frequency");
+	if (ret)
+		goto error;
 	tevs->link_freq->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 
 	/* link_freq = (pixel_rate * bpp) / (2 * data_lanes) */
@@ -1654,11 +1874,20 @@ static int tevs_ctrls_init(struct tevs *tevs)
 		v4l2_ctrl_new_std(&ctrl_hdl->ctrl_handler, &tevs_ctrl_ops,
 				  V4L2_CID_PIXEL_RATE, pixel_rate[0],
 				  pixel_rate[0], 1, pixel_rate[0]);
+	ret = tevs_check_ctrl(tevs, tevs->pixel_rate, "pixel rate");
+	if (ret)
+		goto error;
 	tevs->pixel_rate->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 
 	tevs->bsl = v4l2_ctrl_new_custom(&ctrl_hdl->ctrl_handler, &tevs_bsl_mode, NULL);
+	ret = tevs_check_ctrl(tevs, tevs->bsl, "BSL mode");
+	if (ret)
+		goto error;
 
 	tevs->max_fps = v4l2_ctrl_new_custom(&ctrl_hdl->ctrl_handler, &tevs_max_fps, NULL);
+	ret = tevs_check_ctrl(tevs, tevs->max_fps, "maximum FPS");
+	if (ret)
+		goto error;
 	ret = tevs_i2c_read_16b(tevs, TEVS_MAX_FPS, &val);
 	if (ret)
 		goto error;
@@ -1666,12 +1895,13 @@ static int tevs_ctrls_init(struct tevs *tevs)
 		val & TEVS_MAX_FPS_MASK;
 
 	tevs->denoise = v4l2_ctrl_new_custom(&ctrl_hdl->ctrl_handler, &tevs_denoise, NULL);
-	ret = tevs_i2c_read_16b(tevs, TEVS_DENOISE, &val);
-	ctrl_def = val & TEVS_DENOISE_MASK;
-	ret += tevs_i2c_read_16b(tevs, TEVS_DENOISE_MAX, &val);
-	ctrl_max = val & TEVS_DENOISE_MASK;
-	ret += tevs_i2c_read_16b(tevs, TEVS_DENOISE_MIN, &val);
-	ctrl_min = val & TEVS_DENOISE_MASK;
+	ret = tevs_check_ctrl(tevs, tevs->denoise, "denoise");
+	if (ret)
+		goto error;
+	ret = tevs_read_ctrl_range(tevs, TEVS_DENOISE, TEVS_DENOISE_MAX,
+				   TEVS_DENOISE_MIN, sizeof(u16),
+				   TEVS_DENOISE_MASK, &ctrl_def,
+				   &ctrl_max, &ctrl_min);
 	if (ret)
 		goto error;
 	tevs->denoise->default_value = tevs->denoise->cur.val = ctrl_def;
@@ -1680,12 +1910,15 @@ static int tevs_ctrls_init(struct tevs *tevs)
 
 	tevs->ae_exp_upper =
 		v4l2_ctrl_new_custom(&ctrl_hdl->ctrl_handler, &tevs_ae_exp_upper, NULL);
-	ret = tevs_i2c_read(tevs, TEVS_AE_AUTO_EXP_TIME_UPPER, exp, 4);
-	ctrl_def = be32_to_cpup((__be32 *)exp) & TEVS_AE_AUTO_EXP_TIME_MASK;
-	ret += tevs_i2c_read(tevs, TEVS_AE_MANUAL_EXP_TIME_MAX, exp, 4);
-	ctrl_max = be32_to_cpup((__be32 *)exp) & TEVS_AE_MANUAL_EXP_TIME_MASK;
-	ret += tevs_i2c_read(tevs, TEVS_AE_MANUAL_EXP_TIME_MIN, exp, 4);
-	ctrl_min = be32_to_cpup((__be32 *)exp) & TEVS_AE_MANUAL_EXP_TIME_MASK;
+	ret = tevs_check_ctrl(tevs, tevs->ae_exp_upper,
+			      "auto-exposure upper limit");
+	if (ret)
+		goto error;
+	ret = tevs_read_ctrl_range(tevs, TEVS_AE_AUTO_EXP_TIME_UPPER,
+				   TEVS_AE_MANUAL_EXP_TIME_MAX,
+				   TEVS_AE_MANUAL_EXP_TIME_MIN, sizeof(u32),
+				   TEVS_AE_AUTO_EXP_TIME_MASK, &ctrl_def,
+				   &ctrl_max, &ctrl_min);
 	if (ret)
 		goto error;
 	tevs->ae_exp_upper->default_value = tevs->ae_exp_upper->cur.val =
@@ -1695,6 +1928,10 @@ static int tevs_ctrls_init(struct tevs *tevs)
 
 	tevs->ae_exp_max =
 		v4l2_ctrl_new_custom(&ctrl_hdl->ctrl_handler, &tevs_ae_exp_max, NULL);
+	ret = tevs_check_ctrl(tevs, tevs->ae_exp_max,
+			      "auto-exposure maximum");
+	if (ret)
+		goto error;
 	ret = tevs_i2c_read(tevs, TEVS_AE_AUTO_EXP_TIME_MAX, exp, 4);
 	ctrl_def = be32_to_cpup((__be32 *)exp) & TEVS_AE_AUTO_EXP_TIME_MASK;
 	if (ret)
@@ -1705,30 +1942,23 @@ static int tevs_ctrls_init(struct tevs *tevs)
 
 	tevs->trigger =
 		v4l2_ctrl_new_custom(&ctrl_hdl->ctrl_handler, &tevs_trigger_mode, NULL);
+	ret = tevs_check_ctrl(tevs, tevs->trigger, "trigger mode");
+	if (ret)
+		goto error;
 	tevs->trigger->default_value = tevs->trigger->cur.val = tevs->trigger_mode;
 
 	if (ctrl_hdl->ctrl_handler.error) {
 		dev_err(&tevs->tc_dev->client->dev, "ctrls error\n");
 		ret = ctrl_hdl->ctrl_handler.error;
-		v4l2_ctrl_handler_free(&ctrl_hdl->ctrl_handler);
-		return ret;
+		goto error;
 	}
 
-	/* Use same lock for controls as for everything else. */
-	ctrl_hdl->ctrl_handler.lock = &tevs->lock;
 	tevs->v4l2_subdev->ctrl_handler = &ctrl_hdl->ctrl_handler;
 
 	return 0;
 
 error:
-	v4l2_ctrl_handler_free(&ctrl_hdl->ctrl_handler);
-
 	return ret;
-}
-
-static void tevs_ctrls_free(struct tevs *tevs)
-{
-	v4l2_ctrl_handler_free(&tevs->ctrls);
 }
 
 static int tevs_power_on(struct camera_common_data *s_data)
@@ -1740,11 +1970,13 @@ static int tevs_power_on(struct camera_common_data *s_data)
 
 	gpiod_set_value_cansleep(tevs->reset_gpio, 1);
 
-	msleep(TEVS_BOOT_TIME);
+	if (!tevs->reset_booted)
+		msleep(TEVS_BOOT_TIME);
 
 	ret = tevs_check_boot_state(tevs);
 	if (ret != 0)
 		return ret;
+	tevs->reset_booted = true;
 
 	if ((tevs->hw_reset_mode | tevs->trigger_mode)) {
 		ret = tevs_init_setting(tevs);
@@ -1763,6 +1995,7 @@ static int tevs_power_off(struct camera_common_data *s_data)
 	if (tevs->hw_reset_mode) {
 		gpiod_set_value_cansleep(tevs->reset_gpio, 0);
 		gpiod_set_value_cansleep(tevs->standby_gpio, 0);
+		tevs->reset_booted = false;
 	}
 
 	return 0;
@@ -2162,6 +2395,13 @@ static int tevs_try_on(struct tevs *tevs)
 	return tevs_power_on(tevs->s_data);
 }
 
+static void tevs_assert_reset(struct tevs *tevs)
+{
+	gpiod_set_value_cansleep(tevs->reset_gpio, 0);
+	tevs->reset_booted = false;
+	usleep_range(9000, 10000);
+}
+
 static int tevs_setup(struct tevs *tevs)
 {
 	int i = 0;
@@ -2291,54 +2531,63 @@ static int tevs_setup(struct tevs *tevs)
 		tevs->data_lanes, tevs->continuous_clock,
 		tevs->vc_id, tevs->hw_reset_mode, tevs->trigger_mode);
 
-	if (tevs_try_on(tevs) != 0) {
+	ret = tevs_try_on(tevs);
+	if (ret != 0) {
 		dev_err(tevs->dev, "cannot find tevs camera\n");
-		return -EINVAL;
+		ret = -EINVAL;
+		goto error_out;
 	}
 
 	if (tevs->data_frequency != 0) {
 		ret = tevs_i2c_write_16b(tevs,
 					HOST_COMMAND_ISP_CTRL_MIPI_FREQ,
 					tevs->data_frequency);
-		msleep(TEVS_BOOT_TIME);
-		if (tevs_check_boot_state(tevs) != 0) {
-			dev_err(tevs->dev, "check tevs bootup status failed\n");
-			return -EINVAL;
-		}
 		if (ret < 0) {
-			dev_err(tevs->dev, "set mipi frequency failed\n");
-			return -EINVAL;
+			dev_err(tevs->dev, "set mipi frequency failed: %d\n", ret);
+			goto error_out;
+		}
+		msleep(TEVS_BOOT_TIME);
+		ret = tevs_check_boot_state(tevs);
+		if (ret) {
+			dev_err(tevs->dev,
+				"check TEVS boot status after MIPI frequency change failed: %d\n",
+				ret);
+			goto error_out;
 		}
 	}
 
 	if ((ret = tevs_init_setting(tevs)) != 0) {
 		dev_err(tevs->dev, "init setting failed\n");
-		return ret;
+		goto error_out;
 	}
 
 	tevs->header_info = devm_kzalloc(
 			tevs->dev, sizeof(struct header_info), GFP_KERNEL);
 	if (tevs->header_info == NULL) {
 		dev_err(tevs->dev, "allocate header_info failed\n");
-		return -EINVAL;
+		ret = -EINVAL;
+		goto error_out;
 	}
 
 	ret = tevs_check_version(tevs);
 	if (ret < 0) {
 		dev_err(tevs->dev, "dev init failed\n");
-		return -EINVAL;
+		ret = -EINVAL;
+		goto error_out;
 	}
 
 	ret = tevs_load_header_info(tevs);
 	if (ret < 0) {
 		dev_err(tevs->dev, "otp flash init failed\n");
-		return -EINVAL;
+		ret = -EINVAL;
+		goto error_out;
 	}
 
 	ret = tevs_get_chip_id(tevs);
 	if (ret < 0) {
 		dev_err(tevs->dev, "get chip ID failed\n");
-		return -EINVAL;
+		ret = -EINVAL;
+		goto error_out;
 	}
 
 	if (tevs->chip_id == SENSOR_CHIP_ID_NONE) {
@@ -2361,7 +2610,8 @@ static int tevs_setup(struct tevs *tevs)
         else
             dev_err(tevs->dev, "cannot not support the chip ID: 0x%.4X\n",
 				tevs->chip_id);
-		return -ENODEV;
+		ret = -ENODEV;
+		goto error_out;
 	}
 
 	tevs->selected_sensor = i;
@@ -2374,6 +2624,13 @@ static int tevs_setup(struct tevs *tevs)
 	tevs->fps = tevs_sensor_table[tevs->selected_sensor].frmfmt[0].framerates[0];
 
 error_out:
+#ifdef GMSL_SERDES_CTRL
+	/* Keep a failed module from driving the serializer input. */
+	if (ret && tevs->gmsl_ser_np)
+		tevs_assert_reset(tevs);
+	if (ret)
+		tevs_gmsl_quarantine_i2c_link(tevs, "setup failure");
+#endif
 	v4l2_fwnode_endpoint_free(&ep_cfg);
 	fwnode_handle_put(ep);
 
@@ -2420,17 +2677,20 @@ static int tevs_probe(struct i2c_client *client,
 	}
 
 	tevs->dev = dev;
+	mutex_init(&tevs->lock);
 
 #ifdef GMSL_SERDES_CTRL
 	ret = tevs_gmsl_parse_and_wait(tevs);
 	if (ret)
-		return ret;
+		goto error_mutex;
 #endif
 
 	tc_dev = devm_kzalloc(dev,
 			sizeof(struct tegracam_device), GFP_KERNEL);
-	if (!tc_dev)
-		return -ENOMEM;
+	if (!tc_dev) {
+		ret = -ENOMEM;
+		goto error_mutex;
+	}
 	tc_dev->client = client;
 	tc_dev->dev = dev;
 	tc_dev->dev_regmap_config = &tevs_regmap_config;
@@ -2442,7 +2702,7 @@ static int tevs_probe(struct i2c_client *client,
 	ret = tegracam_device_register(tc_dev);
 	if (ret) {
 		dev_err(dev, "tegra camera driver registration failed\n");
-		return ret;
+		goto error_mutex;
 	}
 
 	tevs->tc_dev = tc_dev;
@@ -2455,40 +2715,41 @@ static int tevs_probe(struct i2c_client *client,
 
 	ret = tevs_setup(tevs);
 	if (ret != 0) {
-		tegracam_device_unregister(tc_dev);
 		dev_err(dev, "tevs setup failed\n");
-		return ret;
+		goto unregister_device;
 	}
 
 	ret = tegracam_v4l2subdev_register(tc_dev, true);
 	if (ret) {
 		dev_err(dev, "tegra camera subdev registration failed\n");
-		return ret;
+		goto unregister_device;
 	}
 
-	/*
-	 * tegracam_v4l2 uses the same getter for both g_frame_interval and
-	 * s_frame_interval.  Keep the shared tegracam operations, but override the
-	 * two frame-interval callbacks for TEVS so VIDIOC_S_PARM reaches the sensor.
-	 */
 	ret = tevs_install_frame_interval_ops(tevs);
 	if (ret) {
 		dev_err(dev, "failed to install frame interval operations\n");
-		goto error_probe;
+		goto unregister_subdev;
 	}
 
 	ret = tevs_ctrls_init(tevs);
 	if (ret) {
-		dev_err(&client->dev, "failed to init controls: %d", ret);
-		goto error_probe;
+		dev_err(&client->dev, "failed to init controls: %d\n", ret);
+#ifdef GMSL_SERDES_CTRL
+		if (tevs->gmsl_ser_np && tevs->reset_booted)
+			tevs_assert_reset(tevs);
+		tevs_gmsl_quarantine_i2c_link(tevs, "control initialization failure");
+#endif
+		goto unregister_subdev;
 	}
 
-	if (ret == 0)
-		dev_info(dev, "probe success\n");
-	else
-		dev_err(dev, "probe failed\n");
+	dev_info(dev, "probe success\n");
+	return 0;
 
-error_probe:
+unregister_subdev:
+	tegracam_v4l2subdev_unregister(tc_dev);
+unregister_device:
+	tegracam_device_unregister(tc_dev);
+error_mutex:
 	mutex_destroy(&tevs->lock);
 
 	return ret;
@@ -2498,9 +2759,10 @@ static int tevs_remove(struct i2c_client *client)
 {
 	struct camera_common_data *s_data = to_camera_common_data(&client->dev);
 	struct tevs *tevs = (struct tevs *)s_data->priv;
-	tevs_ctrls_free(tevs);
+
 	tegracam_v4l2subdev_unregister(tevs->tc_dev);
 	tegracam_device_unregister(tevs->tc_dev);
+	mutex_destroy(&tevs->lock);
 	return 0;
 }
 

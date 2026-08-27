@@ -171,6 +171,105 @@ int max_des_is_ready_by_node(struct device_node *des_np)
 }
 EXPORT_SYMBOL_GPL(max_des_is_ready_by_node);
 
+int max_des_serializers_are_ready_by_node(struct device_node *des_np)
+{
+	struct device_node *i2c_mux;
+	struct device_node *link_np;
+	struct device_node *ser_np;
+	struct max_des_priv *priv;
+	unsigned int active_links = 0;
+	unsigned int num_links = 0;
+	unsigned int ready_links = 0;
+	u32 link;
+	int ret = -EPROBE_DEFER;
+
+	if (!des_np)
+		return -EINVAL;
+
+	mutex_lock(&max_des_registry_lock);
+	list_for_each_entry(priv, &max_des_registry, registry_node) {
+		if (priv->dev->of_node != des_np)
+			continue;
+
+		active_links = priv->gmsl_link_mask;
+		num_links = priv->ops->num_links;
+		ret = 0;
+		break;
+	}
+	mutex_unlock(&max_des_registry_lock);
+	if (ret)
+		return ret;
+
+	i2c_mux = of_get_child_by_name(des_np, "i2c-mux");
+	if (!i2c_mux)
+		return -EINVAL;
+
+	for_each_available_child_of_node(i2c_mux, link_np) {
+		if (of_property_read_u32(link_np, "reg", &link) ||
+		    link >= num_links ||
+		    !(active_links & BIT(link)))
+			continue;
+
+		for_each_available_child_of_node(link_np, ser_np) {
+			if (!of_device_is_compatible(ser_np,
+						     "maxim,max96717_tn"))
+				continue;
+
+			ret = max_ser_is_ready_by_node(ser_np);
+			of_node_put(ser_np);
+			if (ret) {
+				of_node_put(link_np);
+				of_node_put(i2c_mux);
+				return ret;
+			}
+
+			ready_links |= BIT(link);
+			break;
+		}
+	}
+	of_node_put(i2c_mux);
+
+	return ready_links == active_links ? 0 : -EPROBE_DEFER;
+}
+EXPORT_SYMBOL_GPL(max_des_serializers_are_ready_by_node);
+
+int max_des_set_i2c_link_quarantine_by_node(struct device_node *des_np,
+					    unsigned int link,
+					    bool quarantine)
+{
+	struct max_des_priv *priv;
+	int ret = -EPROBE_DEFER;
+
+	if (!des_np)
+		return -EINVAL;
+
+	mutex_lock(&max_des_registry_lock);
+	list_for_each_entry(priv, &max_des_registry, registry_node) {
+		if (priv->dev->of_node != des_np)
+			continue;
+
+		if (link >= priv->ops->num_links) {
+			ret = -EINVAL;
+			break;
+		}
+
+		if (!priv->ops->set_i2c_link_quarantine) {
+			ret = -EOPNOTSUPP;
+			break;
+		}
+
+		mutex_lock(&priv->lock);
+		ret = priv->ops->set_i2c_link_quarantine(priv, link,
+							 quarantine);
+		mutex_unlock(&priv->lock);
+		break;
+	}
+	mutex_unlock(&max_des_registry_lock);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(max_des_set_i2c_link_quarantine_by_node);
+
 static int max_des_allocate(struct max_des_priv *priv)
 {
 	priv->phys = devm_kcalloc(priv->dev, priv->ops->num_phys,
