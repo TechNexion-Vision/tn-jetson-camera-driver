@@ -129,6 +129,8 @@ struct max_des_ops {
 	int (*init_fsync)(struct max_des_priv *priv, struct max_des_fsync *fsync);
 	int (*update_pipe_remaps)(struct max_des_priv *priv, struct max_des_pipe *pipe);
 	int (*select_links)(struct max_des_priv *priv, unsigned int mask);
+	int (*set_i2c_link_quarantine)(struct max_des_priv *priv,
+				       unsigned int link, bool quarantine);
 	int (*post_init)(struct max_des_priv *priv);
 };
 

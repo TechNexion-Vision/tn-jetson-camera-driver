@@ -274,6 +274,8 @@ struct max96716a_priv {
 
 	struct gpio_desc *reset_gpio;
 
+	u8 i2c_ctrl_a;
+	u8 i2c_ctrl_b;
 	bool errb_enabled;
 };
 
@@ -973,10 +975,16 @@ static int max96716a_check_gmsl_links(struct max_des_priv *des_priv)
 		MAX96716A_CTRL9
 	};
 	unsigned long timeout;
+	int ret;
 
 	dev_dbg(priv->dev, "%s()\n", __func__);
 
-	des_priv->ops->select_links(des_priv, links_mask);
+	ret = des_priv->ops->select_links(des_priv, links_mask);
+	if (ret) {
+		dev_err(priv->dev, "failed to select GMSL links 0x%x: %d\n",
+			links_mask, ret);
+		return ret;
+	}
 
 	msleep(100);
 
@@ -989,7 +997,14 @@ static int max96716a_check_gmsl_links(struct max_des_priv *des_priv)
 			break;
 
 		des_priv->links[current_link].enabled = false;
-		if ((max96716a_read(priv, link_lock_addr[current_link]) & MAX96716A_CTRL3_LOCKED)) {
+		ret = max96716a_read(priv, link_lock_addr[current_link]);
+		if (ret < 0) {
+			dev_err(priv->dev,
+				"failed to read GMSL link %d lock status: %d\n",
+				current_link, ret);
+			return ret;
+		}
+		if (ret & MAX96716A_CTRL3_LOCKED) {
 			locked_links_mask |= BIT(current_link);
 			des_priv->links[current_link].enabled = true;
 		}
@@ -1004,28 +1019,41 @@ static int max96716a_check_gmsl_links(struct max_des_priv *des_priv)
 		usleep_range(1000, 2000);
 	}
 
+	for (ret = 0; ret < des_priv->ops->num_links; ret++) {
+		if (!(des_priv->gmsl_link_mask & BIT(ret)))
+			continue;
+		dev_dbg(priv->dev, "GMSL link %d physical lock: %s\n", ret,
+			 locked_links_mask & BIT(ret) ? "locked" : "not locked");
+	}
+
 	return locked_links_mask;
 }
 
 static int max96716a_init(struct max_des_priv *des_priv)
 {
 	struct max96716a_priv *priv = des_to_priv(des_priv);
-	unsigned int locked_links;
+	int locked_links;
 	int retries = 3;
 	int ret;
 
 	while (retries--) {
 		locked_links = max96716a_check_gmsl_links(des_priv);
+		if (locked_links < 0)
+			return locked_links;
 		if (locked_links == des_priv->gmsl_link_mask)
 			break;
 
-		max96716a_update_bits(priv, MAX96716A_CTRL0,
-					   MAX96716A_CTRL0_RESET_LINK,
-					   MAX96716A_CTRL0_RESET_LINK);
+		ret = max96716a_update_bits(priv, MAX96716A_CTRL0,
+					    MAX96716A_CTRL0_RESET_LINK,
+					    MAX96716A_CTRL0_RESET_LINK);
+		if (ret)
+			return ret;
 		usleep_range(2000, 2500);
-		max96716a_update_bits(priv, MAX96716A_CTRL0,
-					   MAX96716A_CTRL0_RESET_LINK,
-					   0x00);
+		ret = max96716a_update_bits(priv, MAX96716A_CTRL0,
+					    MAX96716A_CTRL0_RESET_LINK,
+					    0x00);
+		if (ret)
+			return ret;
 		usleep_range(2000, 2500);
 	}
 
@@ -1673,9 +1701,9 @@ static int max96716a_select_links(struct max_des_priv *des_priv,
 				   MAX96716A_CTRL0_RESET_ONESHOT);
 	if (ret)
 		return ret;
-	max96716a_update_bits(priv, MAX96716A_CTRL2,
-				   MAX96716A_CTRL2_RESET_ONESHOT_B,
-				   MAX96716A_CTRL2_RESET_ONESHOT_B);
+	ret = max96716a_update_bits(priv, MAX96716A_CTRL2,
+				    MAX96716A_CTRL2_RESET_ONESHOT_B,
+				    MAX96716A_CTRL2_RESET_ONESHOT_B);
 	if (ret)
 		return ret;
 
@@ -1684,8 +1712,47 @@ static int max96716a_select_links(struct max_des_priv *des_priv,
 	return 0;
 }
 
+static int max96716a_set_i2c_link_quarantine(struct max_des_priv *des_priv,
+					    unsigned int link,
+					    bool quarantine)
+{
+	struct max96716a_priv *priv = des_to_priv(des_priv);
+	unsigned int reg;
+	u8 val;
+	int ret;
+
+	if (link == 0) {
+		reg = MAX96716A_REG1;
+		val = priv->i2c_ctrl_a;
+		if (quarantine)
+			val |= MAX96716A_REG1_DIS_REM_CC;
+	} else if (link == 1) {
+		reg = MAX96716A_REG3;
+		val = priv->i2c_ctrl_b;
+		if (quarantine)
+			val |= MAX96716A_REG3_DIS_REM_CC_B;
+	} else {
+		return -EINVAL;
+	}
+
+	/*
+	 * A remote NACK can leave local reads blocked, but a direct write to
+	 * DIS_REM_CC still completes and releases the local control channel.
+	 */
+	ret = max96716a_write(priv, reg, val);
+	if (ret)
+		return ret;
+
+	usleep_range(10, 20);
+	dev_dbg(priv->dev, "%s remote I2C link %u\n",
+		quarantine ? "quarantined" : "restored", link);
+
+	return 0;
+}
+
 static int max96716a_post_init(struct max_des_priv *des_priv)
 {
+	struct max96716a_priv *priv = des_to_priv(des_priv);
 	struct max_des_subdev_priv *sd_priv;
 	struct max_des_pipe *pipe;
 	const struct max_format *fmt;
@@ -1716,7 +1783,21 @@ static int max96716a_post_init(struct max_des_priv *des_priv)
 			return -EINVAL;
 	}
 
-	return max96716a_mipi_enable(des_priv, false);
+	ret = max96716a_mipi_enable(des_priv, false);
+	if (ret)
+		return ret;
+
+	ret = max96716a_read(priv, MAX96716A_REG1);
+	if (ret < 0)
+		return ret;
+	priv->i2c_ctrl_a = ret;
+
+	ret = max96716a_read(priv, MAX96716A_REG3);
+	if (ret < 0)
+		return ret;
+	priv->i2c_ctrl_b = ret;
+
+	return 0;
 }
 
 static const struct max_des_ops max96716a_ops = {
@@ -1731,6 +1812,7 @@ static const struct max_des_ops max96716a_ops = {
 	.init_fsync = max96716a_init_fsync,
 	.update_pipe_remaps = max96716a_update_pipe_remaps,
 	.select_links = max96716a_select_links,
+	.set_i2c_link_quarantine = max96716a_set_i2c_link_quarantine,
 	.post_init = max96716a_post_init,
 };
 

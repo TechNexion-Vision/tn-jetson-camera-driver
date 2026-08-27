@@ -1020,6 +1020,52 @@ static int max96717_init_lane_config(struct max96717_priv *priv)
 	return 0;
 }
 
+static int max96717_gpio_init(struct max96717_priv *priv)
+{
+	int ret;
+
+	/* Register the pin controller once the serializer responds. */
+	priv->pctldesc = (struct pinctrl_desc) {
+		.owner = THIS_MODULE,
+		.name = MAX96717_PINCTRL_NAME,
+		.pins = max96717_pins,
+		.npins = ARRAY_SIZE(max96717_pins),
+		.pctlops = &max96717_ctrl_ops,
+		.confops = &max96717_conf_ops,
+		.pmxops = &max96717_mux_ops,
+		.custom_params = max96717_cfg_params,
+		.num_custom_params = ARRAY_SIZE(max96717_cfg_params),
+	};
+
+	ret = devm_pinctrl_register_and_init(priv->dev, &priv->pctldesc, priv,
+					    &priv->pctldev);
+	if (ret)
+		return ret;
+
+	ret = pinctrl_enable(priv->pctldev);
+	if (ret)
+		return ret;
+
+	priv->gc = (struct gpio_chip) {
+		.owner = THIS_MODULE,
+		.label = MAX96717_GPIOCHIP_NAME,
+		.base = -1,
+		.ngpio = MAX96717_GPIO_NUM,
+		.parent = priv->dev,
+		.can_sleep = true,
+		.request = gpiochip_generic_request,
+		.free = gpiochip_generic_free,
+		.set_config = gpiochip_generic_config,
+		.get_direction = max96717_gpio_get_direction,
+		.direction_input = max96717_gpio_direction_input,
+		.direction_output = max96717_gpio_direction_output,
+		.get = max96717_gpio_get,
+		.set = max96717_gpio_set,
+	};
+
+	return devm_gpiochip_add_data(priv->dev, &priv->gc, priv);
+}
+
 static int max96717_init(struct max_ser_priv *ser_priv)
 {
 	struct max96717_priv *priv = ser_to_priv(ser_priv);
@@ -1092,6 +1138,7 @@ static int max96717_init(struct max_ser_priv *ser_priv)
 static int max96717_init_i2c_xlate(struct max_ser_priv *ser_priv, unsigned int i)
 {
 	struct max96717_priv *priv = ser_to_priv(ser_priv);
+	unsigned int expected;
 	int ret;
 
 	dev_dbg(priv->dev, "%s()\n", __func__);
@@ -1109,6 +1156,35 @@ static int max96717_init_i2c_xlate(struct max_ser_priv *ser_priv, unsigned int i
 						ser_priv->i2c_xlates[i].dst));
 	if (ret)
 		return ret;
+
+	ret = max96717_read(priv, MAX96717_I2C_2(i));
+	if (ret < 0)
+		return ret;
+	expected = field_prep(MAX96717_I2C_2_SRC,
+			      ser_priv->i2c_xlates[i].src);
+	if ((ret & MAX96717_I2C_2_SRC) != expected) {
+		dev_err(priv->dev,
+			"I2C alias %u local readback mismatch: got 0x%02x expected 0x%02x\n",
+			i, ret, expected);
+		return -EIO;
+	}
+
+	ret = max96717_read(priv, MAX96717_I2C_3(i));
+	if (ret < 0)
+		return ret;
+	expected = field_prep(MAX96717_I2C_3_DST,
+			      ser_priv->i2c_xlates[i].dst);
+	if ((ret & MAX96717_I2C_3_DST) != expected) {
+		dev_err(priv->dev,
+			"I2C alias %u remote readback mismatch: got 0x%02x expected 0x%02x\n",
+			i, ret, expected);
+		return -EIO;
+	}
+
+	dev_dbg(priv->dev,
+		 "verified I2C alias %u local 0x%02x -> remote 0x%02x\n",
+		 i, ser_priv->i2c_xlates[i].src,
+		 ser_priv->i2c_xlates[i].dst);
 
 	return 0;
 }
@@ -1441,45 +1517,7 @@ static int max96717_probe(struct i2c_client *client)
 	if (ret)
 		return ret;
 
-	/* Register pin controller */
-	priv->pctldesc = (struct pinctrl_desc) {
-		.owner = THIS_MODULE,
-		.name = MAX96717_PINCTRL_NAME,
-		.pins = max96717_pins,
-		.npins = ARRAY_SIZE(max96717_pins),
-		.pctlops = &max96717_ctrl_ops,
-		.confops = &max96717_conf_ops,
-		.pmxops = &max96717_mux_ops,
-		.custom_params = max96717_cfg_params,
-		.num_custom_params = ARRAY_SIZE(max96717_cfg_params),
-	};
-
-	ret = devm_pinctrl_register_and_init(dev, &priv->pctldesc, priv, &priv->pctldev);
-	if (ret)
-		return ret;
-
-	ret = pinctrl_enable(priv->pctldev);
-	if (ret)
-		return ret;
-
-	priv->gc = (struct gpio_chip) {
-		.owner = THIS_MODULE,
-		.label = MAX96717_GPIOCHIP_NAME,
-		.base = -1,
-		.ngpio = MAX96717_GPIO_NUM,
-		.parent = dev,
-		.can_sleep = true,
-		.request = gpiochip_generic_request,
-		.free = gpiochip_generic_free,
-		.set_config = gpiochip_generic_config,
-		.get_direction = max96717_gpio_get_direction,
-		.direction_input = max96717_gpio_direction_input,
-		.direction_output = max96717_gpio_direction_output,
-		.get = max96717_gpio_get,
-		.set = max96717_gpio_set,
-	};
-
-	ret = devm_gpiochip_add_data(dev, &priv->gc, priv);
+	ret = max96717_gpio_init(priv);
 	if (ret)
 		return ret;
 
