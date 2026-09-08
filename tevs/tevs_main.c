@@ -704,45 +704,46 @@ static int tevs_get_chip_id(struct tevs *tevs)
 
 static int tevs_standby(struct tevs *tevs, int enable)
 {
-	u16 v = 0xFFFF;
-	int timeout = 0;
+	u16 command = enable == 1 ? 0x0000 : 0x0001;
+	u16 expected = command | (command << 8);
+	u16 v = 0xffff;
+	unsigned int attempt;
+	int ret;
+
 	dev_dbg(tevs->dev, "%s():enable=%d\n", __func__, enable);
 
-	if (enable == 1) {
-		tevs_i2c_write_16b(tevs, HOST_COMMAND_ISP_CTRL_SYSTEM_START,
-				     0x0000);
-		while (timeout < 100) {
-			tevs_i2c_read_16b(
-				tevs, HOST_COMMAND_ISP_CTRL_SYSTEM_START, &v);
-			if ((v & 0xFF00) == 0x0000)
-				break;
-			if (++timeout >= 100) {
-				dev_err(tevs->dev, "timeout: line[%d]v=%x\n",
-					__LINE__, v);
-				return -EINVAL;
-			}
+	ret = tevs_i2c_write_16b(tevs, HOST_COMMAND_ISP_CTRL_SYSTEM_START,
+				 command);
+	if (ret)
+		return ret;
+
+	for (attempt = 0; attempt < 100; attempt++) {
+		v = 0xffff;
+		ret = tevs_i2c_read_16b(tevs,
+				      HOST_COMMAND_ISP_CTRL_SYSTEM_START, &v);
+		/*
+		 * Both bytes are defined as 0 (standby) or 1 (work).
+		 * Require the requested command and completed status together:
+		 * an undocumented reply such as 0x0060 is not standby complete.
+		 */
+		if (!ret && v == expected) {
+			dev_dbg(tevs->dev, "sensor %s\n",
+				command ? "wakeup" : "standby");
+			return 0;
+		}
+
+		if (attempt == 99)
+			break;
+		if (enable == 1)
 			usleep_range(90000, 100000);
-		}
-		dev_dbg(tevs->dev, "sensor standby\n");
-	} else {
-		tevs_i2c_write_16b(tevs, HOST_COMMAND_ISP_CTRL_SYSTEM_START,
-				     0x0001);
-		while (timeout < 100) {
-			tevs_i2c_read_16b(
-				tevs, HOST_COMMAND_ISP_CTRL_SYSTEM_START, &v);
-			if ((v & 0xFF00) == 0x0100)
-				break;
-			if (++timeout >= 100) {
-				dev_err(tevs->dev, "timeout: line[%d]v=%x\n",
-					__LINE__, v);
-				return -EINVAL;
-			}
+		else
 			usleep_range(9000, 10000);
-		}
-		dev_dbg(tevs->dev, "sensor wakeup\n");
 	}
 
-	return 0;
+	dev_err(tevs->dev,
+		"%s did not complete: expected=0x%04x state=0x%04x read_ret=%d\n",
+		command ? "wakeup" : "standby", expected, v, ret);
+	return ret ? ret : -ETIMEDOUT;
 }
 
 static int tevs_check_boot_state(struct tevs *tevs)
@@ -850,6 +851,8 @@ static int tevs_init_setting(struct tevs *tevs)
 		ret = tevs_i2c_write_16b(tevs,
 				HOST_COMMAND_ISP_CTRL_PREVIEW_HINF_CTRL,
 				0x10 | (TEVS_CONTINUOUS_CLOCK_DEFAULT << 5) | (tevs->data_lanes));
+		if (ret)
+			return ret;
 
 		ret = tevs_standby(tevs, 0);
 		if (ret != 0)
