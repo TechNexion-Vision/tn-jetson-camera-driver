@@ -2,6 +2,7 @@
 #include <linux/of.h>
 #include <linux/of_device.h>
 #include <linux/of_gpio.h>
+#include <linux/workqueue.h>
 
 #include <media/tegra-v4l2-camera.h>
 #include <media/camera_common.h>
@@ -335,6 +336,7 @@ struct tevs {
 	struct device_node *gmsl_des_np;
 	u32 gmsl_ser_channel;
 	u32 gmsl_des_channel;
+	struct tevs_probe_entry *gmsl_probe_entry;
 	bool gmsl_enabled;
 #endif
 
@@ -415,6 +417,154 @@ static void tevs_of_node_put(void *data)
 	of_node_put(data);
 }
 
+/*
+ * Keep terminal probe results outside devres: failed probes must release their
+ * successors too. Entries hold device references until TEVS is unloaded.
+ */
+struct tevs_probe_entry {
+	struct list_head list;
+	struct device *dev;
+	bool done;
+	bool waiting;
+};
+
+static DEFINE_MUTEX(tevs_probe_order_lock);
+static LIST_HEAD(tevs_probe_order);
+static bool tevs_probe_stopping;
+
+static void tevs_retry_ordered_probes(struct work_struct *work)
+{
+	struct tevs_probe_entry *entry;
+	int ret;
+
+	mutex_lock(&tevs_probe_order_lock);
+	/* Entries are only freed after this work is cancelled at module exit. */
+	list_for_each_entry(entry, &tevs_probe_order, list) {
+		if (!entry->waiting)
+			continue;
+		entry->waiting = false;
+		mutex_unlock(&tevs_probe_order_lock);
+		ret = device_attach(entry->dev);
+		if (ret < 0 && ret != -EPROBE_DEFER)
+			dev_dbg(entry->dev, "ordered probe retry: %d\n", ret);
+		mutex_lock(&tevs_probe_order_lock);
+	}
+	mutex_unlock(&tevs_probe_order_lock);
+}
+
+static DECLARE_WORK(tevs_probe_retry_work, tevs_retry_ordered_probes);
+
+static void tevs_stop_probe_retries(void)
+{
+	mutex_lock(&tevs_probe_order_lock);
+	tevs_probe_stopping = true;
+	mutex_unlock(&tevs_probe_order_lock);
+	cancel_work_sync(&tevs_probe_retry_work);
+}
+
+static void tevs_free_probe_order(void)
+{
+	struct tevs_probe_entry *entry, *next;
+
+	list_for_each_entry_safe(entry, next, &tevs_probe_order, list) {
+		put_device(entry->dev);
+		list_del(&entry->list);
+		kfree(entry);
+	}
+}
+
+static int tevs_gmsl_probe_in_order(struct tevs *tevs)
+{
+	struct device_node *parent, *peer, *des, *ser;
+	struct tevs_probe_entry *entry, *own = NULL;
+	u32 channel;
+	bool done;
+	int ret = 0;
+
+	mutex_lock(&tevs_probe_order_lock);
+	if (tevs_probe_stopping) {
+		ret = -ESHUTDOWN;
+		goto out;
+	}
+	list_for_each_entry(entry, &tevs_probe_order, list) {
+		if (entry->dev == tevs->dev) {
+			own = entry;
+			break;
+		}
+	}
+	if (!own) {
+		own = kzalloc(sizeof(*own), GFP_KERNEL);
+		if (!own) {
+			ret = -ENOMEM;
+			goto out;
+		}
+		own->dev = get_device(tevs->dev);
+		list_add_tail(&own->list, &tevs_probe_order);
+	}
+
+	/*
+	 * A later serializer's initial TEVS probe must not overtake an earlier
+	 * channel on the core's deferred queue. Only order siblings on one des.
+	 */
+	parent = of_get_parent(tevs->dev->of_node);
+	for_each_available_child_of_node(parent, peer) {
+		if (!of_device_is_compatible(peer, "tn,tevs"))
+			continue;
+		des = of_parse_phandle(peer, "technexion,gmsl-des", 0);
+		done = des == tevs->gmsl_des_np;
+		of_node_put(des);
+		if (!done ||
+		    of_property_read_u32(peer, "technexion,gmsl-des-channel", &channel) ||
+		    channel >= tevs->gmsl_des_channel)
+			continue;
+
+		/*
+		 * The all-active-serializer barrier has already passed. An
+		 * unready peer serializer therefore belongs to an inactive link.
+		 */
+		ser = of_parse_phandle(peer, "technexion,gmsl-ser", 0);
+		done = ser && !max_ser_is_ready_by_node(ser);
+		of_node_put(ser);
+		if (!done)
+			continue;
+
+		done = false;
+		list_for_each_entry(entry, &tevs_probe_order, list) {
+			if (entry->dev->of_node == peer) {
+				done = entry->done;
+				break;
+			}
+		}
+		if (!done) {
+			ret = -EPROBE_DEFER;
+			of_node_put(peer);
+			break;
+		}
+	}
+	of_node_put(parent);
+	own->waiting = ret == -EPROBE_DEFER;
+	if (!ret) {
+		own->done = false;
+		tevs->gmsl_probe_entry = own;
+	}
+out:
+	mutex_unlock(&tevs_probe_order_lock);
+	return ret;
+}
+
+static void tevs_gmsl_probe_finished(struct tevs *tevs, int ret)
+{
+	if (!tevs->gmsl_probe_entry || ret == -EPROBE_DEFER)
+		return;
+
+	mutex_lock(&tevs_probe_order_lock);
+	/* Success or permanent failure releases successors; deferral does not. */
+	tevs->gmsl_probe_entry->done = true;
+	if (!tevs_probe_stopping)
+		schedule_work(&tevs_probe_retry_work);
+	mutex_unlock(&tevs_probe_order_lock);
+}
+
 static int tevs_gmsl_parse_and_wait(struct tevs *tevs)
 {
 	int ret;
@@ -470,6 +620,10 @@ static int tevs_gmsl_parse_and_wait(struct tevs *tevs)
 		return dev_err_probe(tevs->dev, ret,
 				     "waiting for all active GMSL serializers\n");
 
+	ret = tevs_gmsl_probe_in_order(tevs);
+	if (ret)
+		return dev_err_probe(tevs->dev, ret,
+				     "waiting for earlier GMSL camera channels\n");
 	return 0;
 }
 
@@ -2749,6 +2903,9 @@ static int tevs_probe(struct i2c_client *client)
 	}
 
 	dev_info(dev, "probe success\n");
+#ifdef GMSL_SERDES_CTRL
+	tevs_gmsl_probe_finished(tevs, 0);
+#endif
 	return 0;
 
 unregister_subdev:
@@ -2756,6 +2913,9 @@ unregister_subdev:
 unregister_device:
 	tegracam_device_unregister(tc_dev);
 error_mutex:
+#ifdef GMSL_SERDES_CTRL
+	tevs_gmsl_probe_finished(tevs, ret);
+#endif
 	mutex_destroy(&tevs->lock);
 
 	return ret;
@@ -2768,6 +2928,12 @@ static void tevs_remove(struct i2c_client *client)
 
 	tegracam_v4l2subdev_unregister(tevs->tc_dev);
 	tegracam_device_unregister(tevs->tc_dev);
+#ifdef GMSL_SERDES_CTRL
+	mutex_lock(&tevs_probe_order_lock);
+	if (tevs->gmsl_probe_entry)
+		tevs->gmsl_probe_entry->done = false;
+	mutex_unlock(&tevs_probe_order_lock);
+#endif
 	mutex_destroy(&tevs->lock);
 }
 
@@ -2789,7 +2955,33 @@ static struct i2c_driver sensor_i2c_driver = {
 	.id_table = sensor_id,
 };
 
-module_i2c_driver(sensor_i2c_driver);
+static int __init tevs_driver_init(void)
+{
+	int ret;
+
+	ret = i2c_add_driver(&sensor_i2c_driver);
+#ifdef GMSL_SERDES_CTRL
+	if (ret) {
+		tevs_stop_probe_retries();
+		tevs_free_probe_order();
+	}
+#endif
+	return ret;
+}
+
+static void __exit tevs_driver_exit(void)
+{
+#ifdef GMSL_SERDES_CTRL
+	tevs_stop_probe_retries();
+#endif
+	i2c_del_driver(&sensor_i2c_driver);
+#ifdef GMSL_SERDES_CTRL
+	tevs_free_probe_order();
+#endif
+}
+
+module_init(tevs_driver_init);
+module_exit(tevs_driver_exit);
 
 MODULE_AUTHOR("TECHNEXION Inc.");
 MODULE_DESCRIPTION("TechNexion driver for TEVS");
