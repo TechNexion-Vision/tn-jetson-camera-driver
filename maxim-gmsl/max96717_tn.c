@@ -1020,52 +1020,6 @@ static int max96717_init_lane_config(struct max96717_priv *priv)
 	return 0;
 }
 
-static int max96717_gpio_init(struct max96717_priv *priv)
-{
-	int ret;
-
-	/* Register the pin controller once the serializer responds. */
-	priv->pctldesc = (struct pinctrl_desc) {
-		.owner = THIS_MODULE,
-		.name = MAX96717_PINCTRL_NAME,
-		.pins = max96717_pins,
-		.npins = ARRAY_SIZE(max96717_pins),
-		.pctlops = &max96717_ctrl_ops,
-		.confops = &max96717_conf_ops,
-		.pmxops = &max96717_mux_ops,
-		.custom_params = max96717_cfg_params,
-		.num_custom_params = ARRAY_SIZE(max96717_cfg_params),
-	};
-
-	ret = devm_pinctrl_register_and_init(priv->dev, &priv->pctldesc, priv,
-					    &priv->pctldev);
-	if (ret)
-		return ret;
-
-	ret = pinctrl_enable(priv->pctldev);
-	if (ret)
-		return ret;
-
-	priv->gc = (struct gpio_chip) {
-		.owner = THIS_MODULE,
-		.label = MAX96717_GPIOCHIP_NAME,
-		.base = -1,
-		.ngpio = MAX96717_GPIO_NUM,
-		.parent = priv->dev,
-		.can_sleep = true,
-		.request = gpiochip_generic_request,
-		.free = gpiochip_generic_free,
-		.set_config = gpiochip_generic_config,
-		.get_direction = max96717_gpio_get_direction,
-		.direction_input = max96717_gpio_direction_input,
-		.direction_output = max96717_gpio_direction_output,
-		.get = max96717_gpio_get,
-		.set = max96717_gpio_set,
-	};
-
-	return devm_gpiochip_add_data(priv->dev, &priv->gc, priv);
-}
-
 static int max96717_init(struct max_ser_priv *ser_priv)
 {
 	struct max96717_priv *priv = ser_to_priv(ser_priv);
@@ -1090,9 +1044,9 @@ static int max96717_init(struct max_ser_priv *ser_priv)
 				   MAX96717_RLMSCE_ENMINUS_MAN |
 				   MAX96717_RLMSCE_ENMINUS_REG,
 				   field_prep(MAX96717_RLMSCE_ENMINUS_MAN,
-						MAX96717_RLMSCE_ENMINUS_MAN) |
+						1) |
 				   field_prep(MAX96717_RLMSCE_ENMINUS_REG,
-						MAX96717_RLMSCE_ENMINUS_REG));
+						1));
 	if (ret)
 		return ret;
 
@@ -1449,6 +1403,52 @@ static const struct max_ser_ops max96717_ops = {
 	.init_pipe = max96717_init_pipe,
 	.post_init = max96717_post_init,
 };
+
+static int max96717_gpio_init(struct max96717_priv *priv)
+{
+	int ret;
+
+	/* Register the pin controller once the serializer responds. */
+	priv->pctldesc = (struct pinctrl_desc) {
+		.owner = THIS_MODULE,
+		.name = MAX96717_PINCTRL_NAME,
+		.pins = max96717_pins,
+		.npins = ARRAY_SIZE(max96717_pins),
+		.pctlops = &max96717_ctrl_ops,
+		.confops = &max96717_conf_ops,
+		.pmxops = &max96717_mux_ops,
+		.custom_params = max96717_cfg_params,
+		.num_custom_params = ARRAY_SIZE(max96717_cfg_params),
+	};
+
+	ret = devm_pinctrl_register_and_init(priv->dev, &priv->pctldesc, priv,
+					    &priv->pctldev);
+	if (ret)
+		return ret;
+
+	ret = pinctrl_enable(priv->pctldev);
+	if (ret)
+		return ret;
+
+	priv->gc = (struct gpio_chip) {
+		.owner = THIS_MODULE,
+		.label = MAX96717_GPIOCHIP_NAME,
+		.base = -1,
+		.ngpio = MAX96717_GPIO_NUM,
+		.parent = priv->dev,
+		.can_sleep = true,
+		.request = gpiochip_generic_request,
+		.free = gpiochip_generic_free,
+		.set_config = gpiochip_generic_config,
+		.get_direction = max96717_gpio_get_direction,
+		.direction_input = max96717_gpio_direction_input,
+		.direction_output = max96717_gpio_direction_output,
+		.get = max96717_gpio_get,
+		.set = max96717_gpio_set,
+	};
+
+	return devm_gpiochip_add_data(priv->dev, &priv->gc, priv);
+}
 
 static int max96717_wait_for_device(struct max96717_priv *priv)
 {
