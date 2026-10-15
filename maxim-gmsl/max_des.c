@@ -443,6 +443,7 @@ static int max_des_parse_i2c_dt(struct max_des_priv *priv)
 	u32 local_addr;
 	u32 remote_addr;
 	u32 source_id;
+	int version;
 
 	dev_dbg(priv->dev, "%s()\n", __func__);
 
@@ -518,12 +519,30 @@ static int max_des_parse_i2c_dt(struct max_des_priv *priv)
 			"index: %d local: 0x%x remote: 0x%x id: 0x%x\n",
 			i, xlate->dst, xlate->src, xlate->id);
 
-		ret = max_des_init_link_ser_xlate(priv, link, xlate->dst, xlate->src, xlate->id);
-		if (ret != 0) {
+		if (priv->ops->set_link_version) {
+			for (version = MAX_GMSL_MAX; version >= MAX_GMSL_MIN; version--) {
+				ret = priv->ops->set_link_version(priv, link, version);
+				if (ret) {
+					break;
+				}
+				ret = max_des_init_link_ser_xlate(priv, link, xlate->dst, xlate->src, xlate->id);
+				if (!ret) {
+					dev_info(priv->dev,
+						"gmsl link version set to %d for link %d\n",
+						version, link->index);
+					break;
+				}
+			}
+		}
+		else {
+			ret = max_des_init_link_ser_xlate(priv, link, xlate->dst, xlate->src, xlate->id);
+		}
+		if (ret) {
 			link->enabled = false;
 			continue;
 		}
 
+		link->version = version;
 		priv->gmsl_link_mask |= BIT(i);
 		priv->gmsl_links_used++;
 	}

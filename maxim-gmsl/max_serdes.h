@@ -69,6 +69,14 @@ struct pinfunction {
 #define MAX_SERDES_STREAMS_NUM     4
 #define MAX_SERDES_VC_ID_NUM	   4
 
+enum max_gmsl_version {
+	MAX_GMSL_MIN,
+	MAX_GMSL_2_3Gbps = MAX_GMSL_MIN,
+	MAX_GMSL_2_6Gbps,
+	MAX_GMSL_3,
+	MAX_GMSL_MAX = MAX_GMSL_3,
+};
+
 struct max_i2c_xlate {
 	u8 src;
 	u8 dst;

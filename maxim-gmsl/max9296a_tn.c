@@ -253,6 +253,7 @@ struct max9296a_priv {
 
 struct max9296a_chip_info {
 	unsigned int max_register;
+	enum max_gmsl_version versions;
 	unsigned int num_pipes;
 	unsigned int pipe_hw_ids[MAX9296A_PIPES_NUM];
 	unsigned int num_phys;
@@ -1836,6 +1837,8 @@ static void max9296a_remove(struct i2c_client *client)
 
 static const struct max9296a_chip_info max9296a_info = {
 	.max_register = 0x1f00,
+	.versions = BIT(MAX_GMSL_2_3Gbps) |
+		    BIT(MAX_GMSL_2_6Gbps),
 	.phy0_first_lanes_on_master_phy = true,
 	.supports_phy_log = true,
 	.fix_tx_ids = true,

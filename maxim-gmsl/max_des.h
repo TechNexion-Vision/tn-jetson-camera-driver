@@ -65,6 +65,7 @@ struct max_des_subdev_priv {
 struct max_des_link {
 	unsigned int index;
 	bool enabled;
+	enum max_gmsl_version version;
 	struct max_i2c_xlate ser_xlate;
 	bool ser_xlate_enabled;
 	bool tunnel_mode;
@@ -131,6 +132,8 @@ struct max_des_ops {
 	int (*select_links)(struct max_des_priv *priv, unsigned int mask);
 	int (*set_i2c_link_quarantine)(struct max_des_priv *priv,
 				       unsigned int link, bool quarantine);
+	int (*set_link_version)(struct max_des_priv *priv, struct max_des_link *link,
+					   enum max_gmsl_version version);
 	int (*post_init)(struct max_des_priv *priv);
 };
 
