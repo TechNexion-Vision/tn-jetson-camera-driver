@@ -56,6 +56,24 @@
       "installGroup": "maxim-gmsl",
       "dependsOn": ["max-serdes-common"],
       "legacyOutputs": ["max96716a.ko"]
+    },
+    {
+      "id": "max96792a",
+      "makeDirectory": "maxim-gmsl",
+      "makeTarget": "max96792a_tn",
+      "output": "max96792a_tn.ko",
+      "installGroup": "maxim-gmsl",
+      "dependsOn": ["max-serdes-common"],
+      "legacyOutputs": []
+    },
+    {
+      "id": "max96793",
+      "makeDirectory": "maxim-gmsl",
+      "makeTarget": "max96793_tn",
+      "output": "max96793_tn.ko",
+      "installGroup": "maxim-gmsl",
+      "dependsOn": ["max-serdes-common"],
+      "legacyOutputs": []
     }
   ]
 }
