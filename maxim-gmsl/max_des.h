@@ -22,7 +22,11 @@
 #define MAX_DES_PAD_NUM			2
 
 struct max_des_asd {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 8, 0)
+	struct v4l2_async_connection base;
+#else
 	struct v4l2_async_subdev base;
+#endif
 	struct max_des_subdev_priv *sd_priv;
 };
 
@@ -61,6 +65,7 @@ struct max_des_subdev_priv {
 struct max_des_link {
 	unsigned int index;
 	bool enabled;
+	enum max_gmsl_version version;
 	struct max_i2c_xlate ser_xlate;
 	bool ser_xlate_enabled;
 	bool tunnel_mode;
@@ -127,6 +132,8 @@ struct max_des_ops {
 	int (*select_links)(struct max_des_priv *priv, unsigned int mask);
 	int (*set_i2c_link_quarantine)(struct max_des_priv *priv,
 				       unsigned int link, bool quarantine);
+	int (*set_link_version)(struct max_des_priv *priv, struct max_des_link *link,
+					   enum max_gmsl_version version);
 	int (*post_init)(struct max_des_priv *priv);
 };
 

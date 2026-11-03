@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Maxim MAX96716A Quad GMSL2 Deserializer Driver
+ * Maxim MAX96716A Dual GMSL2 Deserializer Driver
  *
  */
 
@@ -281,6 +281,7 @@ struct max96716a_priv {
 
 struct max96716a_chip_info {
 	unsigned int max_register;
+	enum max_gmsl_version versions;
 	unsigned int num_pipes;
 	unsigned int pipe_hw_ids[MAX96716A_PIPES_NUM];
 	unsigned int num_phys;
@@ -2079,6 +2080,8 @@ static int max96716a_remove(struct i2c_client *client)
 
 static const struct max96716a_chip_info max96716a_info = {
 	.max_register = 0x52d6,
+	.versions = BIT(MAX_GMSL_2_3Gbps) |
+		    BIT(MAX_GMSL_2_6Gbps),
 	.phy0_first_lanes_on_master_phy = true,
 	.supports_pipe_link_remap = true,
 	.supports_tunnel_mode = true,
@@ -2108,6 +2111,6 @@ static struct i2c_driver max96716a_i2c_driver = {
 
 module_i2c_driver(max96716a_i2c_driver);
 
-MODULE_DESCRIPTION("Maxim MAX96716A Quad GMSL2 Deserializer Driver");
+MODULE_DESCRIPTION("Maxim MAX96716A Dual GMSL2 Deserializer Driver");
 MODULE_AUTHOR("TechNexion Inc.");
-MODULE_LICENSE("GPL");
+MODULE_LICENSE("GPL v2");

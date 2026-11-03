@@ -2,8 +2,13 @@
 /*
  */
 
+#include <linux/version.h>
+#include <linux/pinctrl/pinctrl.h>
 #include <linux/types.h>
+
+#include <media/v4l2-async.h>
 #include <media/v4l2-fwnode.h>
+#include <media/v4l2-mediabus.h>
 #include <media/v4l2-subdev.h>
 
 #ifndef MAX_SERDES_H
@@ -12,6 +17,7 @@
 #define field_get(mask, val) (((val) & (mask)) >> __ffs(mask))
 #define field_prep(mask, val) (((val) << __ffs(mask)) & (mask))
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 8, 0)
 #define v4l2_subdev_state v4l2_subdev_pad_config
 #define v4l2_subdev_alloc_state v4l2_subdev_alloc_pad_config
 #define v4l2_subdev_free_state v4l2_subdev_free_pad_config
@@ -22,9 +28,17 @@
 #define v4l2_async_subdev_nf_register v4l2_async_subdev_notifier_register
 #define v4l2_async_nf_add_fwnode(notifier, fwnode, type)		\
 	((type *)v4l2_async_notifier_add_fwnode_subdev(notifier, fwnode, sizeof(type)))
+#endif
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 8, 0)
 #define v4l2_mbus_config_mipi_csi2 v4l2_fwnode_bus_mipi_csi2
+#else
+#define v4l2_fwnode_bus_mipi_csi2 v4l2_mbus_config_mipi_csi2
+#endif
 
+#define MAX_PINCONF_PARAM(_param) ((enum pin_config_param)(_param))
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 8, 0)
 struct pingroup {
 	const char *name;
 	const unsigned int *pins;
@@ -50,9 +64,18 @@ struct pinfunction {
 		.groups = (_groups),			\
 		.ngroups = (_ngroups),			\
 	}
+#endif
 
 #define MAX_SERDES_STREAMS_NUM     4
 #define MAX_SERDES_VC_ID_NUM	   4
+
+enum max_gmsl_version {
+	MAX_GMSL_MIN,
+	MAX_GMSL_2_3Gbps = MAX_GMSL_MIN,
+	MAX_GMSL_2_6Gbps,
+	MAX_GMSL_3,
+	MAX_GMSL_MAX = MAX_GMSL_3,
+};
 
 struct max_i2c_xlate {
 	u8 src;

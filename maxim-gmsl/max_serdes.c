@@ -87,3 +87,5 @@ const struct max_format *max_format_by_name(const char *name)
 	return NULL;
 }
 EXPORT_SYMBOL_GPL(max_format_by_name);
+
+MODULE_LICENSE("GPL v2");
