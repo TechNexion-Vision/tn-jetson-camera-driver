@@ -1092,15 +1092,6 @@ static int max96724_mipi_enable(struct max_des_priv *des_priv, bool enable)
 		if (ret)
 			return ret;
 
-		if (des_priv->fsync->internal ||
-			des_priv->fsync->internal_output) {
-			ret = max96724_update_bits(priv, MAX96724_FSYNC_23,
-						   MAX96724_FSYNC_23_FSYNC_RST_MODE,
-						   MAX96724_FSYNC_23_FSYNC_RST_MODE);
-			if (ret)
-				return ret;
-		}
-
 		/* Enable the first output only after CSI_OUT_EN. */
 		for (i = 0; i < des_priv->ops->num_phys; i++) {
 			if (!(priv->pending_phy_enable & BIT(i)))
@@ -1111,15 +1102,6 @@ static int max96724_mipi_enable(struct max_des_priv *des_priv, bool enable)
 		}
 		priv->pending_phy_enable = 0;
 	} else {
-		if (des_priv->fsync->internal ||
-			des_priv->fsync->internal_output) {
-			ret = max96724_update_bits(priv, MAX96724_FSYNC_23,
-						   MAX96724_FSYNC_23_FSYNC_RST_MODE,
-						   0x00);
-			if (ret)
-				return ret;
-		}
-
 		ret = max96724_update_bits(priv, MAX96724_BACKTOP12,
 					   MAX96724_BACKTOP12_CSI_OUT_EN,
 					   0x00);
@@ -1719,8 +1701,16 @@ static int max96724_init_fsync(struct max_des_priv *des_priv,
 		if (ret)
 			return ret;
 
+		/* Triggered sensors may need FSYNC before CSI stream-on/power-up. */
+		ret = max96724_update_bits(priv, MAX96724_FSYNC_23,
+					   MAX96724_FSYNC_23_FSYNC_RST_MODE,
+					   MAX96724_FSYNC_23_FSYNC_RST_MODE);
+		if (ret)
+			return ret;
+
 		ret = max96724_update_bits(priv, MAX96724_FSYNC_0,
-					   MAX96724_FSYNC_0_FSYNC_MODE,
+					   MAX96724_FSYNC_0_FSYNC_MODE |
+					   MAX96724_FSYNC_0_FSYNC_METH,
 					   field_prep(MAX96724_FSYNC_0_FSYNC_MODE,
 					   		fsync->internal ?
 					   		MAX96724_FSYNC_0_FSYNC_MODE_GEN_ON_IO_OFF :
