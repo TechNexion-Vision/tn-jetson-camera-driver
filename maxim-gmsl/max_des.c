@@ -173,8 +173,8 @@ EXPORT_SYMBOL_GPL(max_des_is_ready_by_node);
 
 int max_des_serializers_are_ready_by_node(struct device_node *des_np)
 {
-	struct device_node *i2c_mux;
-	struct device_node *link_np;
+	struct device_node *camera_np;
+	struct device_node *ref_np;
 	struct device_node *ser_np;
 	struct max_des_priv *priv;
 	unsigned int active_links = 0;
@@ -200,36 +200,48 @@ int max_des_serializers_are_ready_by_node(struct device_node *des_np)
 	if (ret)
 		return ret;
 
-	i2c_mux = of_get_child_by_name(des_np, "i2c-mux");
-	if (!i2c_mux)
-		return -EINVAL;
-
-	for_each_available_child_of_node(i2c_mux, link_np) {
-		if (of_property_read_u32(link_np, "reg", &link) ||
-		    link >= num_links ||
-		    !(active_links & BIT(link)))
+	/* Resolve camera dependencies by phandle, independent of chip model. */
+	for_each_node_with_property(camera_np, "technexion,gmsl-des") {
+		if (!of_device_is_available(camera_np))
 			continue;
 
-		for_each_available_child_of_node(link_np, ser_np) {
-			if (!of_device_is_compatible(ser_np,
-						     "maxim,max96717_tn"))
-				continue;
-
-			ret = max_ser_is_ready_by_node(ser_np);
-			of_node_put(ser_np);
-			if (ret) {
-				of_node_put(link_np);
-				of_node_put(i2c_mux);
-				return ret;
-			}
-
-			ready_links |= BIT(link);
-			break;
+		ref_np = of_parse_phandle(camera_np, "technexion,gmsl-des", 0);
+		if (ref_np != des_np) {
+			of_node_put(ref_np);
+			continue;
 		}
-	}
-	of_node_put(i2c_mux);
+		of_node_put(ref_np);
 
-	return ready_links == active_links ? 0 : -EPROBE_DEFER;
+		ret = of_property_read_u32(camera_np,
+					   "technexion,gmsl-des-channel", &link);
+		if (ret || link >= num_links) {
+			ret = -EINVAL;
+			goto out_put_camera;
+		}
+		if (!(active_links & BIT(link)))
+			continue;
+
+		ser_np = of_parse_phandle(camera_np, "technexion,gmsl-ser", 0);
+		if (!ser_np || !of_device_is_available(ser_np)) {
+			of_node_put(ser_np);
+			ret = -EINVAL;
+			goto out_put_camera;
+		}
+
+		ret = max_ser_is_ready_by_node(ser_np);
+		of_node_put(ser_np);
+		if (ret)
+			goto out_put_camera;
+
+		ready_links |= BIT(link);
+	}
+
+	/* Every active link must have an enabled camera dependency in DT. */
+	return ready_links == active_links ? 0 : -EINVAL;
+
+out_put_camera:
+	of_node_put(camera_np);
+	return ret;
 }
 EXPORT_SYMBOL_GPL(max_des_serializers_are_ready_by_node);
 
