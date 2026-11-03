@@ -279,6 +279,7 @@ struct max96724_priv {
 
 	unsigned int i2c_addr;
 	unsigned int source_id;
+	unsigned int pending_phy_enable;
 
 	struct gpio_desc *reset_gpio;
 };
@@ -1060,9 +1061,28 @@ static int max96724_log_phy_status(struct max_des_priv *des_priv,
 	return 0;
 }
 
+static int max96724_set_phy_enable(struct max_des_priv *des_priv,
+				  unsigned int phy_id, bool enable)
+{
+	struct max96724_priv *priv = des_to_priv(des_priv);
+	struct max_des_phy *phy = max_des_phy_by_id(des_priv, phy_id);
+	unsigned int mask;
+
+	if (phy->mipi.num_data_lanes == 4 ||
+	    (phy_id == 1 && phy->mipi.clock_lane == MAX96724_PHY1_ALT_CLOCK &&
+	     phy->mipi.num_data_lanes == 2))
+		mask = MAX96724_MIPI_PHY2_PHY_STDB_N_4(phy_id);
+	else
+		mask = MAX96724_MIPI_PHY2_PHY_STDB_N_2(phy_id);
+
+	return max96724_update_bits(priv, MAX96724_MIPI_PHY2, mask,
+				   enable ? mask : 0);
+}
+
 static int max96724_mipi_enable(struct max_des_priv *des_priv, bool enable)
 {
 	struct max96724_priv *priv = des_to_priv(des_priv);
+	unsigned int i;
 	int ret;
 
 	if (enable) {
@@ -1080,6 +1100,16 @@ static int max96724_mipi_enable(struct max_des_priv *des_priv, bool enable)
 			if (ret)
 				return ret;
 		}
+
+		/* Enable the first output only after CSI_OUT_EN. */
+		for (i = 0; i < des_priv->ops->num_phys; i++) {
+			if (!(priv->pending_phy_enable & BIT(i)))
+				continue;
+			ret = max96724_set_phy_enable(des_priv, i, true);
+			if (ret)
+				goto err_disable_mipi;
+		}
+		priv->pending_phy_enable = 0;
 	} else {
 		if (des_priv->fsync->internal ||
 			des_priv->fsync->internal_output) {
@@ -1095,20 +1125,69 @@ static int max96724_mipi_enable(struct max_des_priv *des_priv, bool enable)
 					   0x00);
 		if (ret)
 			return ret;
+		priv->pending_phy_enable = 0;
 	}
 
 	return 0;
+
+err_disable_mipi:
+	for (i = 0; i < des_priv->ops->num_phys; i++) {
+		if (priv->pending_phy_enable & BIT(i))
+			max96724_set_phy_enable(des_priv, i, false);
+	}
+	priv->pending_phy_enable = 0;
+	max96724_update_bits(priv, MAX96724_BACKTOP12,
+			       MAX96724_BACKTOP12_CSI_OUT_EN,
+				   0);
+	return ret;
 }
 
 static int max96724_set_pipe_enable(struct max_des_priv *des_priv,
 				    struct max_des_pipe *pipe, bool enable)
 {
 	struct max96724_priv *priv = des_to_priv(des_priv);
+	struct max_des_subdev_priv *sd_priv;
+	bool phy_active = false;
+	int ret;
 
-	return max96724_update_bits(priv, MAX96724_VIDEO_PIPE_EN,
+	/* The common core holds its lock and has not marked a new channel active. */
+	for_each_subdev(des_priv, sd_priv) {
+		if (sd_priv->active && sd_priv->phy_id == pipe->phy_id) {
+			phy_active = true;
+			break;
+		}
+	}
+
+	if (enable && !phy_active) {
+		if (des_priv->active) {
+			ret = max96724_set_phy_enable(des_priv, pipe->phy_id, true);
+			if (ret)
+				return ret;
+		} else {
+			/* Global CSI output is enabled by the core after this callback. */
+			priv->pending_phy_enable |= BIT(pipe->phy_id);
+		}
+	}
+
+	ret = max96724_update_bits(priv, MAX96724_VIDEO_PIPE_EN,
 				   MAX96724_VIDEO_PIPE_EN_MASK(pipe->index),
 				   field_prep(MAX96724_VIDEO_PIPE_EN_MASK(pipe->index),
 				   		enable));
+	if (ret) {
+		if (enable && !phy_active) {
+			priv->pending_phy_enable &= ~BIT(pipe->phy_id);
+			max96724_set_phy_enable(des_priv, pipe->phy_id, false);
+		}
+		return ret;
+	}
+
+	/* Stream-off has already cleared this channel's active flag in the core. */
+	if (!enable && !phy_active) {
+		priv->pending_phy_enable &= ~BIT(pipe->phy_id);
+		return max96724_set_phy_enable(des_priv, pipe->phy_id, false);
+	}
+
+	return 0;
 }
 
 struct max96724_lane_config {
@@ -1417,16 +1496,8 @@ static int max96724_init_phy(struct max_des_priv *des_priv,
 	if (ret)
 		return ret;
 
-	/* Enable PHY. */
-	shift = 4;
-	if (num_hw_data_lanes == 4)
-		/* PHY 1 -> bits [1:0] */
-		/* PHY 2 -> bits [3:2] */
-		mask = 0x3 << ((index / 2) * 2 + shift);
-	else
-		mask = 0x1 << (index + shift);
-
-	ret = max96724_update_bits(priv, MAX96724_MIPI_PHY2, mask, mask);
+	/* Keep the output idle until its first receiver has started. */
+	ret = max96724_set_phy_enable(des_priv, index, false);
 	if (ret)
 		return ret;
 
@@ -2041,4 +2112,4 @@ module_i2c_driver(max96724_i2c_driver);
 
 MODULE_DESCRIPTION("Maxim MAX96724 Quad GMSL2 Deserializer Driver");
 MODULE_AUTHOR("TechNexion Inc.");
-MODULE_LICENSE("GPL");
+MODULE_LICENSE("GPL v2");
