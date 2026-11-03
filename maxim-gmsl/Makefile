@@ -6,5 +6,7 @@ obj-m += max96724_tn.o
 obj-m += max96712_tn.o
 obj-m += max9296a_tn.o
 obj-m += max96716a_tn.o
+obj-m += max96792a_tn.o
+obj-m += max96793_tn.o
 
 endif
