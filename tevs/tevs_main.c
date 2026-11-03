@@ -2313,23 +2313,6 @@ static int tevs_start_streaming(struct tegracam_device *tc_dev)
 	    tevs_sensor_table[tevs->selected_sensor].res_list_size)
 		return -EINVAL;
 
-
-#ifdef GMSL_SERDES_CTRL
-	ret = tevs_gmsl_enable(tevs, true);
-	if (ret)
-		return ret;
-#endif
-
-	ret = tevs_standby(tevs, 0);
-	if (ret)
-		return ret;
-
-	if (tevs->trigger_mode) {
-		ret = tevs_write_trigger_mode(tevs, tevs->trigger_mode);
-		if (ret)
-			return ret;
-	}
-
 	dev_dbg(tc_dev->dev, "%s() width=%d, height=%d, mode=%d\n",
 		__func__,
 		tevs_sensor_table[tevs->selected_sensor]
@@ -2402,6 +2385,22 @@ static int tevs_start_streaming(struct tegracam_device *tc_dev)
 		return ret;
 	tevs->ae_exp_max->cur.val = be32_to_cpup((__be32 *)exp) &
 			TEVS_AE_MANUAL_EXP_TIME_MASK;
+
+#ifdef GMSL_SERDES_CTRL
+	ret = tevs_gmsl_enable(tevs, true);
+	if (ret)
+		return ret;
+#endif
+
+	ret = tevs_standby(tevs, 0);
+	if (ret)
+		return ret;
+
+	if (tevs->trigger_mode) {
+		ret = tevs_write_trigger_mode(tevs, tevs->trigger_mode);
+		if (ret)
+			return ret;
+	}
 
 	return ret;
 }
@@ -2983,6 +2982,6 @@ module_exit(tevs_driver_exit);
 
 MODULE_AUTHOR("TECHNEXION Inc.");
 MODULE_DESCRIPTION("TechNexion driver for TEVS");
-MODULE_LICENSE("GPL");
+MODULE_LICENSE("GPL v2");
 MODULE_VERSION("2.0");
 MODULE_ALIAS("Camera");
