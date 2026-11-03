@@ -2113,4 +2113,4 @@ module_i2c_driver(max96716a_i2c_driver);
 
 MODULE_DESCRIPTION("Maxim MAX96716A Dual GMSL2 Deserializer Driver");
 MODULE_AUTHOR("TechNexion Inc.");
-MODULE_LICENSE("GPL");
+MODULE_LICENSE("GPL v2");

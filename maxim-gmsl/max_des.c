@@ -1199,4 +1199,4 @@ int max_des_remove(struct max_des_priv *priv)
 }
 EXPORT_SYMBOL_GPL(max_des_remove);
 
-MODULE_LICENSE("GPL");
+MODULE_LICENSE("GPL v2");

@@ -1591,4 +1591,4 @@ module_i2c_driver(max96793_i2c_driver);
 
 MODULE_DESCRIPTION("MAX96793 GMSL3/2 Serializer Driver");
 MODULE_AUTHOR("TechNexion Inc.");
-MODULE_LICENSE("GPL");
+MODULE_LICENSE("GPL v2");

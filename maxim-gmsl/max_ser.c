@@ -788,4 +788,4 @@ int max_ser_fix_tx_ids(struct regmap *regmap, u8 addr)
 }
 EXPORT_SYMBOL_GPL(max_ser_fix_tx_ids);
 
-MODULE_LICENSE("GPL");
+MODULE_LICENSE("GPL v2");

@@ -1868,4 +1868,4 @@ module_i2c_driver(max9296a_i2c_driver);
 
 MODULE_DESCRIPTION("Maxim MAX9296A Quad GMSL2 Deserializer Driver");
 MODULE_AUTHOR("TechNexion Inc.");
-MODULE_LICENSE("GPL");
+MODULE_LICENSE("GPL v2");
