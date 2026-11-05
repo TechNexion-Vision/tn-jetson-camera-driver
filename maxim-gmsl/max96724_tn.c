@@ -18,6 +18,10 @@
 
 #define MAX96724_REG0							0x0
 
+#define MAX96724_REG5							0x5
+#define MAX96724_REG5_ERRB_EN					BIT(6)
+#define MAX96724_REG5_LOCK_EN					BIT(7)
+
 #define MAX96724_REG6							0x6
 #define MAX96724_REG6_LINK_EN					GENMASK(3, 0)
 
@@ -259,6 +263,8 @@
 #define MAX96724_PHY1_ALT_CLOCK		5
 #define MAX96724_NAME 				"max96724"
 #define MAX96724_GPIO_NUM 			9
+
+#define MAX96724_GPIO_ERRB			5
 
 static const struct regmap_config max96724_i2c_regmap = {
 	.reg_bits = 16,
@@ -802,6 +808,37 @@ static int max96724_conf_pin_config_get(struct pinctrl_dev *pctldev,
 	return 0;
 }
 
+static int max96724_errb_enable(struct max96724_priv *priv, bool enable)
+{
+	int ret;
+
+	ret = max96724_update_bits(priv, MAX96724_REG5,
+				   MAX96724_REG5_ERRB_EN,
+				   field_prep(MAX96724_REG5_ERRB_EN, enable));
+	if (ret)
+		return ret;
+
+	dev_info(priv->dev, "ERRB output %s\n", enable ? "enabled" : "disabled");
+
+	return 0;
+}
+
+static int max96724_gpio_rx_link(u32 param)
+{
+	switch (param) {
+	case MAX96724_PINCTRL_GMSL_RX_EN_A:
+		return 0;
+	case MAX96724_PINCTRL_GMSL_RX_EN_B:
+		return 1;
+	case MAX96724_PINCTRL_GMSL_RX_EN_C:
+		return 2;
+	case MAX96724_PINCTRL_GMSL_RX_EN_D:
+		return 3;
+	default:
+		return -1;
+	}
+}
+
 static int max96724_conf_pin_config_set_one(struct max96724_priv *priv,
 					    unsigned int offset,
 					    unsigned long config)
@@ -841,6 +878,12 @@ static int max96724_conf_pin_config_set_one(struct max96724_priv *priv,
 		val = field_prep(mask, arg ? val : ~val);
 
 		ret = max96724_update_bits(priv, reg, mask, val);
+
+		if (offset == MAX96724_GPIO_ERRB) {
+			ret = max96724_errb_enable(priv, false);
+			if (ret)
+				return ret;
+		}
 		break;
 	case MAX96724_PINCTRL_GMSL_TX_ID_A:
 	case MAX96724_PINCTRL_GMSL_TX_ID_B:
