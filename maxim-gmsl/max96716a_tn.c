@@ -90,8 +90,6 @@
 #define MAX96716A_GPIO_C(x)						(0x2b2 + (x) * 3)
 #define MAX96716A_GPIO_C_GPIO_RX_ID				GENMASK(4, 0)
 
-#define MAX96716A_GPIO_ERRB						4
-
 #define MAX96716A_BACKTOP12						0x313
 #define MAX96716A_BACKTOP12_CSI_OUT_EN			BIT(1)
 
@@ -252,6 +250,8 @@
 #define MAX96716A_NAME			"max96716a"
 #define MAX96716A_GPIO_NUM		13
 
+#define MAX96716A_GPIO_ERRB		4
+
 static const struct regmap_config max96716a_i2c_regmap = {
 	.reg_bits = 16,
 	.val_bits = 8,
@@ -276,7 +276,6 @@ struct max96716a_priv {
 
 	u8 i2c_ctrl_a;
 	u8 i2c_ctrl_b;
-	bool errb_enabled;
 };
 
 struct max96716a_chip_info {
@@ -711,8 +710,7 @@ static int max96716a_conf_pin_config_set_one(struct max96716a_priv *priv,
 		ret = max96716a_update_bits(priv, reg, mask, val);
 
 		if (offset == MAX96716A_GPIO_ERRB) {
-			priv->errb_enabled = false;
-			ret = max96716a_errb_enable(priv, priv->errb_enabled);
+			ret = max96716a_errb_enable(priv, false);
 			if (ret)
 				return ret;
 		}
@@ -1996,7 +1994,6 @@ static int max96716a_probe(struct i2c_client *client)
 	priv->des_priv.regmap = priv->regmap;
 	priv->des_priv.ops = ops;
 
-	priv->errb_enabled = true;
 	priv->i2c_addr = priv->client->addr;
 	of_property_read_u32(dev->of_node, "phy-reg", &priv->i2c_addr);
 	of_property_read_u32(dev->of_node, "source-id", &priv->source_id);

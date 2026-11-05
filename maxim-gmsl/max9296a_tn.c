@@ -87,8 +87,6 @@
 #define MAX9296A_GPIO_C(x)						(0x2b2 + (x) * 3)
 #define MAX9296A_GPIO_C_GPIO_RX_ID				GENMASK(4, 0)
 
-#define MAX9296A_GPIO_ERRB						4
-
 #define MAX9296A_BACKTOP12						0x313
 #define MAX9296A_BACKTOP12_CSI_OUT_EN			BIT(1)
 
@@ -226,6 +224,8 @@
 #define MAX9296A_NAME			"max9296a"
 #define MAX9296A_GPIO_NUM		13
 
+#define MAX9296A_GPIO_ERRB		4
+
 static const struct regmap_config max9296a_i2c_regmap = {
 	.reg_bits = 16,
 	.val_bits = 8,
@@ -247,8 +247,6 @@ struct max9296a_priv {
 	unsigned int source_id;
 
 	struct gpio_desc *reset_gpio;
-
-	bool errb_enabled;
 };
 
 struct max9296a_chip_info {
@@ -603,7 +601,6 @@ static int max9296a_errb_enable(struct max9296a_priv *priv, bool enable)
 	return 0;
 }
 
-
 static int max9296a_conf_pin_config_set_one(struct max9296a_priv *priv,
 						unsigned int offset,
 						unsigned long config)
@@ -639,8 +636,7 @@ static int max9296a_conf_pin_config_set_one(struct max9296a_priv *priv,
 		ret = max9296a_update_bits(priv, reg, mask, val);
 
 		if (offset == MAX9296A_GPIO_ERRB) {
-			priv->errb_enabled = false;
-			ret = max9296a_errb_enable(priv, priv->errb_enabled);
+			ret = max9296a_errb_enable(priv, false);
 			if (ret)
 				return ret;
 		}
@@ -1753,7 +1749,6 @@ static int max9296a_probe(struct i2c_client *client)
 	priv->des_priv.regmap = priv->regmap;
 	priv->des_priv.ops = ops;
 
-	priv->errb_enabled = true;
 	priv->i2c_addr = priv->client->addr;
 	of_property_read_u32(dev->of_node, "phy-reg", &priv->i2c_addr);
 	of_property_read_u32(dev->of_node, "source-id", &priv->source_id);
