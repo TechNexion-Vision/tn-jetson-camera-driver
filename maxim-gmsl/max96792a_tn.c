@@ -257,6 +257,8 @@ struct max96792a_priv {
 
 	unsigned int i2c_addr;
 	unsigned int source_id;
+	unsigned int gpio_rx_links;
+	bool gpio_rx_links_valid;
 
 	struct gpio_desc *reset_gpio;
 
@@ -658,6 +660,17 @@ static int max96792a_errb_enable(struct max96792a_priv *priv, bool enable)
 	return 0;
 }
 
+static int max96792a_gpio_rx_link(u32 param)
+{
+	switch (param) {
+	case MAX96792A_PINCTRL_GMSL_RX_EN_A:
+		return 0;
+	case MAX96792A_PINCTRL_GMSL_RX_EN_B:
+		return 1;
+	default:
+		return -1;
+	}
+}
 
 static int max96792a_conf_pin_config_set_one(struct max96792a_priv *priv,
 						unsigned int offset,
@@ -666,7 +679,13 @@ static int max96792a_conf_pin_config_set_one(struct max96792a_priv *priv,
 	u32 param = pinconf_to_config_param(config);
 	u32 arg = pinconf_to_config_argument(config);
 	unsigned int reg, mask, val;
+	int link = max96792a_gpio_rx_link(param);
 	int ret;
+
+	/* Default pinctrl may be applied again after the driver's probe. */
+	if (link >= 0 && priv->gpio_rx_links_valid &&
+	    !(priv->gpio_rx_links & BIT(link)))
+		arg = 0;
 
 	ret = max96792a_get_pin_config_reg(offset, param, &reg, &mask, &val);
 	if (ret)
@@ -1718,6 +1737,45 @@ static int max96792a_set_link_version(struct max_des_priv *des_priv,
 	return 0;
 }
 
+static int max96792a_filter_gpio_rx_links(struct max_des_priv *des_priv)
+{
+	static const u32 params[] = {
+		MAX96792A_PINCTRL_GMSL_RX_EN_A,
+		MAX96792A_PINCTRL_GMSL_RX_EN_B,
+	};
+	struct max96792a_priv *priv = des_to_priv(des_priv);
+	unsigned int link, pin, reg, mask, val;
+	int ret;
+
+	priv->gpio_rx_links = 0;
+	for (link = 0; link < des_priv->ops->num_links; link++) {
+		if (des_priv->links[link].enabled)
+			priv->gpio_rx_links |= BIT(link);
+	}
+	priv->gpio_rx_links_valid = true;
+
+	/* Also remove routes installed before link detection completed. */
+	for (link = 0; link < ARRAY_SIZE(params); link++) {
+		if (priv->gpio_rx_links & BIT(link))
+			continue;
+
+		for (pin = 0; pin < MAX96792A_GPIO_NUM; pin++) {
+			ret = max96792a_get_pin_config_reg(pin, params[link],
+							 &reg, &mask, &val);
+			if (ret)
+				return ret;
+			ret = max96792a_update_bits(priv, reg, mask, 0);
+			if (ret)
+				return ret;
+		}
+	}
+
+	dev_info(priv->dev, "GPIO RX restricted to probe link mask 0x%x\n",
+		 priv->gpio_rx_links);
+
+	return 0;
+}
+
 static int max96792a_post_init(struct max_des_priv *des_priv)
 {
 	struct max96792a_priv *priv = des_to_priv(des_priv);
@@ -1727,6 +1785,10 @@ static int max96792a_post_init(struct max_des_priv *des_priv)
 	int ret;
 
 	dev_dbg(des_priv->dev, "%s()\n", __func__);
+
+	ret = max96792a_filter_gpio_rx_links(des_priv);
+	if (ret)
+		return ret;
 
 	for_each_subdev(des_priv, sd_priv) {
 		pipe = &des_priv->pipes[sd_priv->pipe_id];
