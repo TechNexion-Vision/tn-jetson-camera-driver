@@ -285,6 +285,7 @@ struct max96712_priv {
 
 	unsigned int i2c_addr;
 	unsigned int source_id;
+	unsigned int pending_phy_enable;
 	unsigned int gpio_rx_links;
 	bool gpio_rx_links_valid;
 
@@ -1090,6 +1091,24 @@ static int max96712_log_phy_status(struct max_des_priv *des_priv,
 	return 0;
 }
 
+static int max96712_set_phy_enable(struct max_des_priv *des_priv,
+				  unsigned int phy_id, bool enable)
+{
+	struct max96712_priv *priv = des_to_priv(des_priv);
+	struct max_des_phy *phy = max_des_phy_by_id(des_priv, phy_id);
+	unsigned int mask;
+
+	if (phy->mipi.num_data_lanes == 4 ||
+	    (phy_id == 1 && phy->mipi.clock_lane == MAX96712_PHY1_ALT_CLOCK &&
+	     phy->mipi.num_data_lanes == 2))
+		mask = MAX96712_MIPI_PHY2_PHY_STDB_N_4(phy_id);
+	else
+		mask = MAX96712_MIPI_PHY2_PHY_STDB_N_2(phy_id);
+
+	return max96712_update_bits(priv, MAX96712_MIPI_PHY2, mask,
+				   enable ? mask : 0);
+}
+
 static unsigned int max96712_mipi_force_clock_mask(struct max_des_priv *des_priv)
 {
 	unsigned int mask = 0;
@@ -1107,13 +1126,10 @@ static unsigned int max96712_mipi_force_clock_mask(struct max_des_priv *des_priv
 
 		/*
 		 * In the four-lane configurations logical PHY1 combines
-		 * physical PHY0/PHY1 and uses clock 0.  Logical PHY2 combines
-		 * physical PHY2/PHY3 and uses clock 3.
+		 * physical PHY0/PHY1 and uses clock 0.
 		 */
 		if (phy->index == 1)
 			mask |= MAX96712_MIPI_PHY0_FORCE_CLK0_EN;
-		else if (phy->index == 2)
-			mask |= MAX96712_MIPI_PHY0_FORCE_CLK3_EN;
 	}
 
 	return mask;
@@ -1123,6 +1139,7 @@ static int max96712_mipi_enable(struct max_des_priv *des_priv, bool enable)
 {
 	struct max96712_priv *priv = des_to_priv(des_priv);
 	unsigned int force_clk_mask = max96712_mipi_force_clock_mask(des_priv);
+	unsigned int i;
 	int ret;
 
 	if (enable) {
@@ -1146,6 +1163,16 @@ static int max96712_mipi_enable(struct max_des_priv *des_priv, bool enable)
 			if (ret)
 				return ret;
 		}
+
+		/* Enable the first output only after CSI_OUT_EN. */
+		for (i = 0; i < des_priv->ops->num_phys; i++) {
+			if (!(priv->pending_phy_enable & BIT(i)))
+				continue;
+			ret = max96712_set_phy_enable(des_priv, i, true);
+			if (ret)
+				goto err_disable_mipi;
+		}
+		priv->pending_phy_enable = 0;
 	} else {
 		if (des_priv->fsync->internal ||
 			des_priv->fsync->internal_output) {
@@ -1167,9 +1194,20 @@ static int max96712_mipi_enable(struct max_des_priv *des_priv, bool enable)
 					   0x00);
 		if (ret)
 			return ret;
+		priv->pending_phy_enable = 0;
 	}
 
 	return 0;
+
+err_disable_mipi:
+	for (i = 0; i < des_priv->ops->num_phys; i++) {
+		if (priv->pending_phy_enable & BIT(i))
+			max96712_set_phy_enable(des_priv, i, false);
+	}
+	priv->pending_phy_enable = 0;
+	max96712_update_bits(priv, MAX96712_BACKTOP12,
+			       MAX96712_BACKTOP12_CSI_OUT_EN,
+				   0);
 
 clear_force_clock:
 	max96712_update_bits(priv, MAX96712_MIPI_PHY0,
@@ -1181,11 +1219,48 @@ static int max96712_set_pipe_enable(struct max_des_priv *des_priv,
 				    struct max_des_pipe *pipe, bool enable)
 {
 	struct max96712_priv *priv = des_to_priv(des_priv);
+	struct max_des_subdev_priv *sd_priv;
+	bool phy_active = false;
+	int ret;
 
-	return max96712_update_bits(priv, MAX96712_VIDEO_PIPE_EN,
+	/* The common core holds its lock and has not marked a new channel active. */
+	for_each_subdev(des_priv, sd_priv) {
+		if (sd_priv->active && sd_priv->phy_id == pipe->phy_id) {
+			phy_active = true;
+			break;
+		}
+	}
+
+	if (enable && !phy_active) {
+		if (des_priv->active) {
+			ret = max96712_set_phy_enable(des_priv, pipe->phy_id, true);
+			if (ret)
+				return ret;
+		} else {
+			/* Global CSI output is enabled by the core after this callback. */
+			priv->pending_phy_enable |= BIT(pipe->phy_id);
+		}
+	}
+
+	ret = max96712_update_bits(priv, MAX96712_VIDEO_PIPE_EN,
 				   MAX96712_VIDEO_PIPE_EN_MASK(pipe->index),
 				   field_prep(MAX96712_VIDEO_PIPE_EN_MASK(pipe->index),
 				   		enable));
+	if (ret) {
+		if (enable && !phy_active) {
+			priv->pending_phy_enable &= ~BIT(pipe->phy_id);
+			max96712_set_phy_enable(des_priv, pipe->phy_id, false);
+		}
+		return ret;
+	}
+
+	/* Stream-off has already cleared this channel's active flag in the core. */
+	if (!enable && !phy_active) {
+		priv->pending_phy_enable &= ~BIT(pipe->phy_id);
+		return max96712_set_phy_enable(des_priv, pipe->phy_id, false);
+	}
+
+	return 0;
 }
 
 struct max96712_lane_config {
@@ -1494,16 +1569,8 @@ static int max96712_init_phy(struct max_des_priv *des_priv,
 	if (ret)
 		return ret;
 
-	/* Enable PHY. */
-	shift = 4;
-	if (num_hw_data_lanes == 4)
-		/* PHY 1 -> bits [1:0] */
-		/* PHY 2 -> bits [3:2] */
-		mask = 0x3 << ((index / 2) * 2 + shift);
-	else
-		mask = 0x1 << (index + shift);
-
-	ret = max96712_update_bits(priv, MAX96712_MIPI_PHY2, mask, mask);
+	/* Keep the output idle until its first receiver has started. */
+	ret = max96712_set_phy_enable(des_priv, index, false);
 	if (ret)
 		return ret;
 
