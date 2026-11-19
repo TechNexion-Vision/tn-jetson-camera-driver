@@ -80,6 +80,9 @@ const struct max_format *max_format_by_name(const char *name)
 {
 	unsigned int i;
 
+	if (!name)
+		return NULL;
+
 	for (i = 0; i < ARRAY_SIZE(max_formats); i++)
 		if (!strcmp(max_formats[i].name, name))
 			return &max_formats[i];
